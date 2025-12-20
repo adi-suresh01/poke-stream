@@ -1,4 +1,4 @@
 /target
-/sample_images
-/assets
+/sample_images/*
+/assets/*
 
