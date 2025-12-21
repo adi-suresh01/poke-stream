@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-image = "0.25"
-termios = "0.3"
+image = { version = "0.25", features = ["gif"] }
+tokio = { version = "1.37", features = ["macros", "net", "io-util", "rt-multi-thread", "sync", "time"] }

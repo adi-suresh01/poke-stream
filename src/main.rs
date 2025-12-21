@@ -1,15 +1,13 @@
 mod ascii;
 mod pokemon;
 
-use std::{
-    fmt::Write,
-    io::{self, BufRead},
-    os::fd::AsRawFd,
-    sync::mpsc,
-    thread,
-    time,
-};
-use termios::{tcsetattr, Termios, ECHO, TCSANOW};
+use std::fmt::Write;
+use std::sync::Arc;
+
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 
 #[derive(PartialEq)]
 enum GameState {
@@ -25,232 +23,294 @@ enum CellColor {
     Rgb(u8, u8, u8),
 }
 
-struct EchoGuard {
-    original: Termios,
+struct Assets {
+    growlithe: ascii::AsciiImage,
+    arcanine_frames: Vec<ascii::AsciiImage>,
 }
 
-impl EchoGuard {
-    fn new() -> Self {
-        let fd = io::stdin().as_raw_fd();
-        let mut term = Termios::from_fd(fd).expect("failed to read termios");
-        let original = term.clone();
-        term.c_lflag &= !ECHO;
-        tcsetattr(fd, TCSANOW, &term).expect("failed to disable echo");
-        Self { original }
+enum Screen {
+    Welcome,
+    Game,
+}
+
+const IMG_CHARSET: &str =
+    ".'`^\",:;Il!i><~+_-?][}{1)(|\\/*tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$Ñ";
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let assets = Arc::new(Assets {
+        growlithe: pokemon::load_growlithe(IMG_CHARSET),
+        arcanine_frames: pokemon::load_arcanine_frames(IMG_CHARSET),
+    });
+
+    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let assets = Arc::clone(&assets);
+        tokio::spawn(async move {
+            let _ = run_session(stream, assets).await;
+        });
     }
 }
 
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        let fd = io::stdin().as_raw_fd();
-        let _ = tcsetattr(fd, TCSANOW, &self.original);
-    }
-}
+async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
-fn main() {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    let _ = cmd_tx.send(String::from("__disconnect__"));
+                    break;
+                }
+                Ok(_) => {
+                    let _ = cmd_tx.send(line.clone());
+                }
+                Err(_) => {
+                    let _ = cmd_tx.send(String::from("__disconnect__"));
+                    break;
+                }
+            }
+        }
+    });
+
     let width = 140;
     let height = 40;
-    
-    // FIX 1: Aspect Ratio set to 1.5 as requested
     let aspect_ratio = 1.5;
-    
-    let chars = " .:-=+*#%@";
-    let img_charset =
-        ".'`^\",:;Il!i><~+_-?][}{1)(|\\/*tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$Ñ";
-    let growlithe = pokemon::load_growlithe(img_charset);
 
-    // --- ANSI COLORS ---
+    let chars = " .:-=+*#%@";
+    let growlithe = &assets.growlithe;
+    let arcanine_frames = &assets.arcanine_frames;
+
     let reset = "\x1b[0m";
     let red = "\x1b[91m";
     let white = "\x1b[97m";
     let black = "\x1b[30m";
 
-    // --- STATE ---
     let mut state = GameState::Idle;
     let mut frame_count = 0;
-    let mut caught_timer = 0; // To track how long we stay in "Caught" state
+    let mut caught_timer = 0;
 
-    // POSITIONS
-    // We align them based on the "Floor" (approx row 25)
-    let floor_y: f32 = 5.0; 
-    
-    let mut ball_x: f32 = -45.0; // Left side
-    let mut ball_y: f32 = floor_y;   
+    let floor_y: f32 = 5.0;
+
+    let mut ball_x: f32 = -45.0;
+    let mut ball_y: f32 = floor_y;
     let ball_scale: f32 = 1.0;
-    let mut a: f32 = 0.0;   
+    let mut a: f32 = 0.0;
     let mut tilt_phase: f32 = 0.0;
 
-    let _echo_guard = EchoGuard::new();
-
-    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines().flatten() {
-            if cmd_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
     let mut last_cmd = String::new();
+    let mut screen = Screen::Welcome;
+    let mut welcome_frame = 0usize;
+    let mut welcome_accum = 0u64;
+    let welcome_frame_ms: u64 = 1000 / 12;
 
-    print!("\x1b[2J"); 
+    write_half.write_all(b"\x1b[2J\x1b[H").await?;
 
     loop {
         let mut output: Vec<char> = vec![' '; width * height];
-        let mut zbuffer: Vec<f32> = vec![-99.0; width * height]; 
+        let mut zbuffer: Vec<f32> = vec![-99.0; width * height];
         let mut color_buf: Vec<CellColor> = vec![CellColor::None; width * height];
 
-        if let Ok(cmd) = cmd_rx.try_recv() {
+        while let Ok(cmd) = cmd_rx.try_recv() {
             let cmd_trim = cmd.trim().to_lowercase();
+            if cmd_trim == "__disconnect__" {
+                return Ok(());
+            }
             last_cmd = cmd_trim.clone();
-            if cmd_trim == "catch" && state == GameState::Idle {
-                state = GameState::Throwing;
-                frame_count = 0;
-            }
-        }
-
-        match state {
-            GameState::Idle => {
-                frame_count += 1;
-                // Wait 60 frames, then throw
-                if frame_count > 60 {
-                    frame_count = 0;
-                }
-            }
-            GameState::Throwing => {
-                // FIX 2: Horizontal Throw (No Arc)
-                // Moves straight towards Pikachu
-                ball_x += 1.5; 
-                
-                // Add a tiny bit of "Roll" bobble just for realism (Sine wave)
-                ball_y = floor_y + (ball_x * 0.5).sin() * 0.5;
-
-                // Hit detection (Pikachu is around x=15)
-                if ball_x > 12.0 {
-                    state = GameState::Caught;
-                    ball_x = 15.0; // Snap to center of Pikachu
-                    ball_y = floor_y;
-                    caught_timer = 0;
-                }
-            }
-            GameState::Caught => {
-                // FIX 3: Reset Loop
-                caught_timer += 1;
-                ball_x = 15.0;
-                
-                // Stay caught for 50 frames (approx 1.5 seconds), then reset
-                if caught_timer > 50 {
-                    state = GameState::Idle;
-                    ball_x = -45.0; // Reset to start
-                    ball_y = floor_y;
-                    frame_count = 0;
-                }
-            }
-        }
-
-        // --- RENDER GROWLITHE (IMAGE -> ASCII, COLOR) ---
-        if state != GameState::Caught {
-            let grow_start_y = 5;
-            let grow_start_x = (width / 2) + 2;
-
-            for y in 0..growlithe.height {
-                for x in 0..growlithe.width {
-                    let target_y = grow_start_y + y;
-                    let target_x = grow_start_x + x;
-                    if target_y < height && target_x < width {
-                        let src_idx = x + y * growlithe.width;
-                        let ch = growlithe.chars[src_idx];
-                        if ch != ' ' {
-                            let idx = target_x + target_y * width;
-                            output[idx] = ch;
-                            let (r, g, b) = growlithe.colors[src_idx];
-                            color_buf[idx] = CellColor::Rgb(r, g, b);
-                            zbuffer[idx] = 0.4;
+            match screen {
+                Screen::Welcome => {
+                    if cmd_trim == "start" || cmd_trim == "play" || cmd_trim == "catch" {
+                        screen = Screen::Game;
+                        if cmd_trim == "catch" && state == GameState::Idle {
+                            state = GameState::Throwing;
+                            frame_count = 0;
                         }
+                    }
+                }
+                Screen::Game => {
+                    if cmd_trim == "catch" && state == GameState::Idle {
+                        state = GameState::Throwing;
+                        frame_count = 0;
                     }
                 }
             }
         }
 
-        // --- RENDER POKEBALL ---
-        let cos_a = a.cos();
-        let sin_a = a.sin();
-        let tilt = 0.25 + 0.1 * tilt_phase.sin();
-        let cos_b = tilt.cos();
-        let sin_b = tilt.sin();
-        let (mut lx, mut ly, mut lz) = (-0.6_f32, 0.4_f32, -1.0_f32);
-        let l_len = (lx * lx + ly * ly + lz * lz).sqrt();
-        lx /= l_len;
-        ly /= l_len;
-        lz /= l_len;
+        if let Screen::Game = screen {
+            match state {
+                GameState::Idle => {
+                    frame_count += 1;
+                    if frame_count > 60 {
+                        frame_count = 0;
+                    }
+                }
+                GameState::Throwing => {
+                    ball_x += 1.5;
+                    ball_y = floor_y + (ball_x * 0.5).sin() * 0.5;
 
-        let mut phi: f32 = 0.0;
-        while phi < 6.28 {
-            let mut theta: f32 = 0.0;
-            while theta < 3.14 {
-                let ox = theta.sin() * phi.cos();
-                let oy = theta.cos();
-                let oz = theta.sin() * phi.sin();
+                    if ball_x > 12.0 {
+                        state = GameState::Caught;
+                        ball_x = 15.0;
+                        ball_y = floor_y;
+                        caught_timer = 0;
+                    }
+                }
+                GameState::Caught => {
+                    caught_timer += 1;
+                    ball_x = 15.0;
 
-                // Texture
-                let mut pixel_char = '.';
-                let pixel_color;
-                let dist_to_button = ox*ox + oy*oy + (oz-1.0)*(oz-1.0);
+                    if caught_timer > 50 {
+                        state = GameState::Idle;
+                        ball_x = -45.0;
+                        ball_y = floor_y;
+                        frame_count = 0;
+                    }
+                }
+            }
+        }
 
-                if dist_to_button < 0.12 { pixel_color = white; pixel_char = '@'; } 
-                else if dist_to_button < 0.18 { pixel_color = black; pixel_char = '#'; } 
-                else if oy > -0.06 && oy < 0.06 { pixel_color = black; pixel_char = '#'; } 
-                else if oy > 0.0 { pixel_color = red; } 
-                else { pixel_color = white; }
+        match screen {
+            Screen::Welcome => {
+                if !arcanine_frames.is_empty() {
+                    let frame = &arcanine_frames[welcome_frame % arcanine_frames.len()];
+                    let start_x = (width.saturating_sub(frame.width)) / 2;
+                    let start_y = (height.saturating_sub(frame.height)) / 2;
 
-                let r = ball_scale;
-                let x = (ox * cos_a - oy * sin_a) * r;
-                let y = (ox * sin_a + oy * cos_a) * r;
-                let z = oz * r;
-
-                let y_final = y * cos_b - z * sin_b;
-                let z_final = y * sin_b + z * cos_b;
-                let x_final = x;
-
-                let camera_dist = 3.0;
-                let ooz = 1.0 / (z_final + camera_dist);
-                
-                // Apply offsets
-                let xp = (width as f32 / 2.0 + ball_x + 30.0 * ooz * x_final * aspect_ratio) as i32;
-                // FIX 5: Adjusted Y offset (+18) to match Pikachu's feet
-                let yp = (height as f32 / 2.0 + ball_y + 18.0 * ooz * y_final) as i32;
-
-                if xp >= 0 && xp < width as i32 && yp >= 0 && yp < height as i32 {
-                    let idx = (xp + yp * width as i32) as usize;
-                    if ooz > zbuffer[idx] {
-                        zbuffer[idx] = ooz;
-
-                        if pixel_char == '@' || pixel_char == '#' {
-                            output[idx] = pixel_char;
-                        } else {
-                            let dot = x_final * lx + y_final * ly + z_final * lz;
-                            let diffuse = dot.max(0.0);
-                            let rz = 2.0 * dot * z_final - lz;
-                            let spec = (rz * -1.0).max(0.0).powf(16.0);
-                            let shade = (0.12 + diffuse * 0.9 + spec * 0.6).min(1.0);
-
-                            let mut l_idx = (shade * (chars.len() - 1) as f32) as usize;
-                            if l_idx >= chars.len() {
-                                l_idx = chars.len() - 1;
+                    for y in 0..frame.height {
+                        for x in 0..frame.width {
+                            let target_y = start_y + y;
+                            let target_x = start_x + x;
+                            if target_y < height && target_x < width {
+                                let src_idx = x + y * frame.width;
+                                let ch = frame.chars[src_idx];
+                                if ch != ' ' {
+                                    let idx = target_x + target_y * width;
+                                    output[idx] = ch;
+                                    let (r, g, b) = frame.colors[src_idx];
+                                    color_buf[idx] = CellColor::Rgb(r, g, b);
+                                    zbuffer[idx] = 0.2;
+                                }
                             }
-                            output[idx] = chars.chars().nth(l_idx).unwrap();
                         }
-                        color_buf[idx] = CellColor::Ansi(pixel_color);
                     }
                 }
-                theta += 0.03;
             }
-            phi += 0.03;
+            Screen::Game => {
+                if state != GameState::Caught {
+                    let grow_start_y = 5;
+                    let grow_start_x = (width / 2) + 2;
+
+                    for y in 0..growlithe.height {
+                        for x in 0..growlithe.width {
+                            let target_y = grow_start_y + y;
+                            let target_x = grow_start_x + x;
+                            if target_y < height && target_x < width {
+                                let src_idx = x + y * growlithe.width;
+                                let ch = growlithe.chars[src_idx];
+                                if ch != ' ' {
+                                    let idx = target_x + target_y * width;
+                                    output[idx] = ch;
+                                    let (r, g, b) = growlithe.colors[src_idx];
+                                    color_buf[idx] = CellColor::Rgb(r, g, b);
+                                    zbuffer[idx] = 0.4;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let cos_a = a.cos();
+                let sin_a = a.sin();
+                let tilt = 0.25 + 0.1 * tilt_phase.sin();
+                let cos_b = tilt.cos();
+                let sin_b = tilt.sin();
+                let (mut lx, mut ly, mut lz) = (-0.6_f32, 0.4_f32, -1.0_f32);
+                let l_len = (lx * lx + ly * ly + lz * lz).sqrt();
+                lx /= l_len;
+                ly /= l_len;
+                lz /= l_len;
+
+                let mut phi: f32 = 0.0;
+                while phi < 6.28 {
+                    let mut theta: f32 = 0.0;
+                    while theta < 3.14 {
+                        let ox = theta.sin() * phi.cos();
+                        let oy = theta.cos();
+                        let oz = theta.sin() * phi.sin();
+
+                        let mut pixel_char = '.';
+                        let pixel_color;
+                        let dist_to_button = ox * ox + oy * oy + (oz - 1.0) * (oz - 1.0);
+
+                        if dist_to_button < 0.12 {
+                            pixel_color = white;
+                            pixel_char = '@';
+                        } else if dist_to_button < 0.18 {
+                            pixel_color = black;
+                            pixel_char = '#';
+                        } else if oy > -0.06 && oy < 0.06 {
+                            pixel_color = black;
+                            pixel_char = '#';
+                        } else if oy > 0.0 {
+                            pixel_color = red;
+                        } else {
+                            pixel_color = white;
+                        }
+
+                        let r = ball_scale;
+                        let x = (ox * cos_a - oy * sin_a) * r;
+                        let y = (ox * sin_a + oy * cos_a) * r;
+                        let z = oz * r;
+
+                        let y_final = y * cos_b - z * sin_b;
+                        let z_final = y * sin_b + z * cos_b;
+                        let x_final = x;
+
+                        let camera_dist = 3.0;
+                        let ooz = 1.0 / (z_final + camera_dist);
+
+                        let xp =
+                            (width as f32 / 2.0 + ball_x + 30.0 * ooz * x_final * aspect_ratio)
+                                as i32;
+                        let yp = (height as f32 / 2.0 + ball_y + 18.0 * ooz * y_final) as i32;
+
+                        if xp >= 0 && xp < width as i32 && yp >= 0 && yp < height as i32 {
+                            let idx = (xp + yp * width as i32) as usize;
+                            if ooz > zbuffer[idx] {
+                                zbuffer[idx] = ooz;
+
+                                if pixel_char == '@' || pixel_char == '#' {
+                                    output[idx] = pixel_char;
+                                } else {
+                                    let dot = x_final * lx + y_final * ly + z_final * lz;
+                                    let diffuse = dot.max(0.0);
+                                    let rz = 2.0 * dot * z_final - lz;
+                                    let spec = (rz * -1.0).max(0.0).powf(16.0);
+                                    let shade = (0.12 + diffuse * 0.9 + spec * 0.6).min(1.0);
+
+                                    let mut l_idx = (shade * (chars.len() - 1) as f32) as usize;
+                                    if l_idx >= chars.len() {
+                                        l_idx = chars.len() - 1;
+                                    }
+                                    output[idx] = chars.chars().nth(l_idx).unwrap();
+                                }
+                                color_buf[idx] = CellColor::Ansi(pixel_color);
+                            }
+                        }
+                        theta += 0.03;
+                    }
+                    phi += 0.03;
+                }
+            }
         }
 
-        // Render
-        print!("\x1b[H");
-        let mut frame = String::with_capacity(width * height * 15);
+        let mut frame = String::with_capacity(width * height * 6);
+        frame.push_str("\x1b[H");
         for i in 0..height {
             for j in 0..width {
                 let idx = j + i * width;
@@ -258,9 +318,7 @@ fn main() {
                     frame.push(' ');
                 } else {
                     match color_buf[idx] {
-                        CellColor::None => {
-                            frame.push(output[idx]);
-                        }
+                        CellColor::None => frame.push(output[idx]),
                         CellColor::Ansi(code) => {
                             frame.push_str(code);
                             frame.push(output[idx]);
@@ -282,20 +340,33 @@ fn main() {
             }
             frame.push('\n');
         }
-        let _ = write!(frame, "command: {} (type 'catch' + Enter)\n", last_cmd);
-        println!("{}", frame);
+        let prompt = match screen {
+            Screen::Welcome => "type 'start' + Enter",
+            Screen::Game => "type 'catch' + Enter",
+        };
+        let _ = write!(frame, "command: {} ({})\n", last_cmd, prompt);
+        write_half.write_all(frame.as_bytes()).await?;
 
-        // Spin Logic
-        if state == GameState::Throwing {
-            // Spin fast when throwing
-            a -= 0.2; 
-        } else if state == GameState::Idle {
-            // Spin slow when idle
-            a -= 0.05;
+        match screen {
+            Screen::Welcome => {
+                welcome_accum += 30;
+                if welcome_accum >= welcome_frame_ms {
+                    welcome_accum = 0;
+                    if !arcanine_frames.is_empty() {
+                        welcome_frame = (welcome_frame + 1) % arcanine_frames.len();
+                    }
+                }
+            }
+            Screen::Game => {
+                if state == GameState::Throwing {
+                    a -= 0.2;
+                } else if state == GameState::Idle {
+                    a -= 0.05;
+                }
+                tilt_phase += 0.04;
+            }
         }
-        // If caught, stop spinning (a stays same)
-        tilt_phase += 0.04;
 
-        thread::sleep(time::Duration::from_millis(30));
+        time::sleep(Duration::from_millis(30)).await;
     }
 }

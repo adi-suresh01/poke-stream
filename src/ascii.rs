@@ -1,4 +1,6 @@
+use image::codecs::gif::GifDecoder;
 use image::imageops::FilterType;
+use image::{AnimationDecoder, DynamicImage, Frame, RgbImage};
 
 pub struct AsciiImage {
     pub width: usize,
@@ -8,11 +10,39 @@ pub struct AsciiImage {
 }
 
 pub fn load_ascii_image(path: &str, width: usize, height: usize, charset: &str) -> AsciiImage {
-    let charset: Vec<char> = charset.chars().collect();
     let img = image::open(path)
         .unwrap_or_else(|_| panic!("failed to load image: {path}"))
         .resize_exact(width as u32, height as u32, FilterType::Nearest)
         .to_rgb8();
+    ascii_from_rgb(img, charset)
+}
+
+pub fn load_ascii_animation(path: &str, width: usize, height: usize, charset: &str) -> Vec<AsciiImage> {
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|_| panic!("failed to load animation: {path}"));
+    let reader = std::io::BufReader::new(file);
+    let decoder = GifDecoder::new(reader)
+        .unwrap_or_else(|_| panic!("failed to decode animation: {path}"));
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .unwrap_or_else(|_| panic!("failed to read animation frames: {path}"));
+
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames.into_iter() {
+        let frame: Frame = frame;
+        let img = DynamicImage::ImageRgba8(frame.into_buffer())
+            .resize_exact(width as u32, height as u32, FilterType::Nearest)
+            .to_rgb8();
+        out.push(ascii_from_rgb(img, charset));
+    }
+    out
+}
+
+fn ascii_from_rgb(img: RgbImage, charset: &str) -> AsciiImage {
+    let charset: Vec<char> = charset.chars().collect();
+    let width = img.width() as usize;
+    let height = img.height() as usize;
 
     let mut base_rgb = Vec::with_capacity(width * height);
     let mut base_lum = Vec::with_capacity(width * height);
