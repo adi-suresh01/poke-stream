@@ -2,6 +2,7 @@ mod ascii;
 mod pokemon;
 
 use std::fmt::Write;
+use std::env;
 use std::sync::Arc;
 
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,6 +32,13 @@ struct Assets {
 enum Screen {
     Welcome,
     Game,
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum ColorMode {
+    Truecolor,
+    Ansi256,
+    Mono,
 }
 
 const IMG_CHARSET: &str =
@@ -90,6 +98,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let red = "\x1b[91m";
     let white = "\x1b[97m";
     let black = "\x1b[30m";
+    let color_mode = color_mode_from_env();
 
     let mut state = GameState::Idle;
     let mut frame_count = 0;
@@ -325,15 +334,27 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                             frame.push_str(reset);
                         }
                         CellColor::Rgb(r, g, b) => {
-                            let _ = write!(
-                                frame,
-                                "\x1b[38;2;{};{};{}m{}",
-                                r,
-                                g,
-                                b,
-                                output[idx]
-                            );
-                            frame.push_str(reset);
+                            match color_mode {
+                                ColorMode::Truecolor => {
+                                    let _ = write!(
+                                        frame,
+                                        "\x1b[38;2;{};{};{}m{}",
+                                        r,
+                                        g,
+                                        b,
+                                        output[idx]
+                                    );
+                                    frame.push_str(reset);
+                                }
+                                ColorMode::Ansi256 => {
+                                    let code = rgb_to_ansi256(r, g, b);
+                                    let _ = write!(frame, "\x1b[38;5;{}m{}", code, output[idx]);
+                                    frame.push_str(reset);
+                                }
+                                ColorMode::Mono => {
+                                    frame.push(output[idx]);
+                                }
+                            }
                         }
                     }
                 }
@@ -369,4 +390,51 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
 
         time::sleep(Duration::from_millis(30)).await;
     }
+}
+
+fn color_mode_from_env() -> ColorMode {
+    if let Ok(mode) = env::var("POKESTREAM_COLOR") {
+        let mode = mode.to_lowercase();
+        if mode == "truecolor" || mode == "24bit" {
+            return ColorMode::Truecolor;
+        }
+        if mode == "ansi256" || mode == "256" {
+            return ColorMode::Ansi256;
+        }
+        if mode == "mono" || mode == "none" {
+            return ColorMode::Mono;
+        }
+    }
+    if let Ok(ct) = env::var("COLORTERM") {
+        let ct = ct.to_lowercase();
+        if ct.contains("truecolor") || ct.contains("24bit") {
+            return ColorMode::Truecolor;
+        }
+    }
+    if let Ok(term) = env::var("TERM") {
+        let term = term.to_lowercase();
+        if term.contains("truecolor") || term.contains("24bit") || term.contains("direct") {
+            return ColorMode::Truecolor;
+        }
+        if term.contains("256color") {
+            return ColorMode::Ansi256;
+        }
+    }
+    ColorMode::Ansi256
+}
+
+fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    // 16-231: 6x6x6 color cube, 232-255: grayscale
+    let r = r as u16;
+    let g = g as u16;
+    let b = b as u16;
+    let gray = (r + g + b) / 3;
+    if gray > 8 && gray < 248 && (r as i16 - g as i16).abs() < 12 && (r as i16 - b as i16).abs() < 12 {
+        let gray_index = ((gray - 8) * 24 / 247) as u8;
+        return 232 + gray_index;
+    }
+    let rc = (r * 5 / 255) as u8;
+    let gc = (g * 5 / 255) as u8;
+    let bc = (b * 5 / 255) as u8;
+    16 + 36 * rc + 6 * gc + bc
 }
