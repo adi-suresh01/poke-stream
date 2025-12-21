@@ -4,6 +4,7 @@ mod pokemon;
 use std::fmt::Write;
 use std::env;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,7 +26,7 @@ enum CellColor {
 }
 
 struct Assets {
-    growlithe: ascii::AsciiImage,
+    pokemons: Vec<ascii::AsciiImage>,
     arcanine_frames: Vec<ascii::AsciiImage>,
 }
 
@@ -47,7 +48,10 @@ const IMG_CHARSET: &str =
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let assets = Arc::new(Assets {
-        growlithe: pokemon::load_growlithe(IMG_CHARSET),
+        pokemons: vec![
+            pokemon::load_growlithe(IMG_CHARSET),
+            pokemon::load_pikachu(IMG_CHARSET),
+        ],
         arcanine_frames: pokemon::load_arcanine_frames(IMG_CHARSET),
     });
 
@@ -91,7 +95,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let aspect_ratio = 1.5;
 
     let chars = " .:-=+*#%@";
-    let growlithe = &assets.growlithe;
+    let pokemon = pick_pokemon(&assets.pokemons);
     let arcanine_frames = &assets.arcanine_frames;
 
     let reset = "\x1b[0m";
@@ -214,17 +218,17 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                     let grow_start_y = 5;
                     let grow_start_x = (width / 2) + 2;
 
-                    for y in 0..growlithe.height {
-                        for x in 0..growlithe.width {
+                    for y in 0..pokemon.height {
+                        for x in 0..pokemon.width {
                             let target_y = grow_start_y + y;
                             let target_x = grow_start_x + x;
                             if target_y < height && target_x < width {
-                                let src_idx = x + y * growlithe.width;
-                                let ch = growlithe.chars[src_idx];
+                                let src_idx = x + y * pokemon.width;
+                                let ch = pokemon.chars[src_idx];
                                 if ch != ' ' {
                                     let idx = target_x + target_y * width;
                                     output[idx] = ch;
-                                    let (r, g, b) = growlithe.colors[src_idx];
+                                    let (r, g, b) = pokemon.colors[src_idx];
                                     color_buf[idx] = CellColor::Rgb(r, g, b);
                                     zbuffer[idx] = 0.4;
                                 }
@@ -437,4 +441,16 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     let gc = (g * 5 / 255) as u8;
     let bc = (b * 5 / 255) as u8;
     16 + 36 * rc + 6 * gc + bc
+}
+
+fn pick_pokemon(pokemons: &[ascii::AsciiImage]) -> &ascii::AsciiImage {
+    if pokemons.is_empty() {
+        panic!("no pokemon assets loaded");
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let idx = (nanos % pokemons.len() as u128) as usize;
+    &pokemons[idx]
 }
