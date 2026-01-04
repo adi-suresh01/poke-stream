@@ -1,6 +1,6 @@
 # Poke-Stream
 
-Terminal-hosted Pokemon capture demo with real-time ASCII animation. Players connect over Telnet and watch a 3D, ray-cast Pokeball animate over 2D Pokemon art, all rendered as colored ASCII characters. The server is written in Rust and uses Tokio to run one game loop per connection.
+Terminal-hosted Pokemon game with real-time ASCII animation. Players connect over Telnet to play and catch Pokemon while a 3D, ray-cast Pokeball animates over 2D Pokemon art, all rendered as colored ASCII characters. The server is written in Rust and uses Tokio to run one game loop per connection.
 
 ![Terminal screenshot](Screenshot%202026-01-04%20at%2016.34.54.png)
 
