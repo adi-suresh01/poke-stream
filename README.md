@@ -2,6 +2,8 @@
 
 Terminal-hosted Pokemon capture demo with real-time ASCII animation. Players connect over Telnet and watch a 3D, ray-cast Pokeball animate over 2D Pokemon art, all rendered as colored ASCII characters. The server is written in Rust and uses Tokio to run one game loop per connection.
 
+![Terminal screenshot](sample_images/Screenshot%202026-01-04%20at%2016.34.54.png)
+
 ## Features
 - Telnet-playable game loop with a welcome screen and capture sequence.
 - Hybrid renderer: 2D ASCII sprites plus a 3D shaded sphere with z-buffering.
