@@ -71,7 +71,7 @@ fn ascii_from_rgb(img: RgbImage, charset: &str) -> AsciiImage {
     let bg_r = (bg_r / 4) as i32;
     let bg_g = (bg_g / 4) as i32;
     let bg_b = (bg_b / 4) as i32;
-    let bg_thresh = 18i32;
+    let bg_thresh = 14i32;
     let mut stack = Vec::new();
     for x in 0..width {
         stack.push((x, 0));

@@ -43,6 +43,7 @@ struct Assets {
 enum Screen {
     Name,
     Pokedex,
+    PokedexDetail,
     Game,
 }
 
@@ -51,6 +52,29 @@ enum ColorMode {
     Truecolor,
     Ansi256,
     Mono,
+}
+
+struct RenderBuffers {
+    output: Vec<char>,
+    zbuffer: Vec<f32>,
+    color_buf: Vec<CellColor>,
+}
+
+impl RenderBuffers {
+    fn new(width: usize, height: usize) -> Self {
+        let len = width * height;
+        Self {
+            output: vec![' '; len],
+            zbuffer: vec![-99.0; len],
+            color_buf: vec![CellColor::None; len],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.output.fill(' ');
+        self.zbuffer.fill(-99.0);
+        self.color_buf.fill(CellColor::None);
+    }
 }
 
 struct PokemonAsset {
@@ -79,9 +103,630 @@ const DB_PATH: &str = "pokedex.db";
 const OPEN_FRAMES: u16 = 10;
 const ABSORB_FRAMES: u16 = 22;
 const CLOSE_FRAMES: u16 = 10;
-const SHAKE_FRAMES: u16 = 20;
+const SHAKE_FRAMES: u16 = 28;
 const SHAKE_COUNT: u8 = 3;
-const STAR_FRAMES: u16 = 18;
+const STAR_FRAMES: u16 = 26;
+
+enum CommandAction {
+    None,
+    Exit,
+    Disconnect,
+}
+
+struct SessionState {
+    width: usize,
+    height: usize,
+    aspect_ratio: f32,
+    chars: &'static str,
+    pokemon_index: usize,
+    trainer_name: Option<String>,
+    pokedex: HashSet<String>,
+    screen: Screen,
+    pokedex_detail: Option<usize>,
+    state: GameState,
+    frame_count: u32,
+    capture_recorded: bool,
+    open_amount: f32,
+    capture_frame: u16,
+    shake_frame: u16,
+    shake_count: u8,
+    stream_particles: Vec<StreamParticle>,
+    align_start_a: f32,
+    star_frame: u16,
+    star_hold: u16,
+    caught_message: Option<String>,
+    caught_message_timer: u16,
+    pokedex_notice: Option<String>,
+    pokedex_notice_timer: u16,
+    floor_y: f32,
+    ball_x: f32,
+    ball_y: f32,
+    ball_scale: f32,
+    a: f32,
+    tilt_phase: f32,
+    welcome_frame: usize,
+    welcome_accum: u64,
+    welcome_frame_ms: u64,
+    last_cmd: String,
+    color_mode: ColorMode,
+}
+
+impl SessionState {
+    fn new(width: usize, height: usize, color_mode: ColorMode, assets: &Assets) -> Self {
+        Self {
+            width,
+            height,
+            aspect_ratio: 1.5,
+            chars: " .:-=+*#%@",
+            pokemon_index: pick_pokemon_index(&assets.pokemons),
+            trainer_name: None,
+            pokedex: HashSet::new(),
+            screen: Screen::Name,
+            pokedex_detail: None,
+            state: GameState::Idle,
+            frame_count: 0,
+            capture_recorded: false,
+            open_amount: 0.0,
+            capture_frame: 0,
+            shake_frame: 0,
+            shake_count: 0,
+            stream_particles: Vec::new(),
+            align_start_a: 0.0,
+            star_frame: 0,
+            star_hold: 0,
+            caught_message: None,
+            caught_message_timer: 0,
+            pokedex_notice: None,
+            pokedex_notice_timer: 0,
+            floor_y: 5.0,
+            ball_x: -45.0,
+            ball_y: 5.0,
+            ball_scale: 1.0,
+            a: 0.0,
+            tilt_phase: 0.0,
+            welcome_frame: 0,
+            welcome_accum: 0,
+            welcome_frame_ms: 1000 / 12,
+            last_cmd: String::new(),
+            color_mode,
+        }
+    }
+
+    fn pokemon<'a>(&self, assets: &'a Assets) -> &'a PokemonAsset {
+        &assets.pokemons[self.pokemon_index]
+    }
+
+    async fn handle_command(&mut self, cmd: &str, assets: &Assets) -> CommandAction {
+        let cmd_trim = cmd.trim().to_lowercase();
+        if cmd.as_bytes().contains(&3) || matches!(cmd_trim.as_str(), "q" | "quit" | "exit") {
+            return CommandAction::Exit;
+        }
+        if cmd_trim == "__disconnect__" {
+            return CommandAction::Disconnect;
+        }
+        self.last_cmd = cmd_trim.clone();
+        match self.screen {
+            Screen::Name => {
+                if let Some(name) = sanitize_trainer_name(&cmd_trim) {
+                    self.pokedex = load_pokedex(&name).await.unwrap_or_default();
+                    self.trainer_name = Some(name);
+                    self.screen = Screen::Game;
+                }
+            }
+            Screen::Pokedex => {
+                if cmd_trim == "back" {
+                    self.screen = Screen::Game;
+                    self.pokedex_detail = None;
+                    self.pokedex_notice = None;
+                    self.pokedex_notice_timer = 0;
+                } else if let Ok(id) = cmd_trim.parse::<usize>() {
+                    if id >= 1 && id <= 151 {
+                        if let Some(name) = assets.pokedex.names.get(id - 1) {
+                            if !name.is_empty() && self.pokedex.contains(name) {
+                                self.pokedex_detail = Some(id - 1);
+                                self.screen = Screen::PokedexDetail;
+                                self.pokedex_notice = None;
+                                self.pokedex_notice_timer = 0;
+                            } else {
+                                self.pokedex_notice = Some("POKEMON NOT CAUGHT YET".to_string());
+                                self.pokedex_notice_timer = 45;
+                            }
+                        }
+                    }
+                }
+            }
+            Screen::PokedexDetail => {
+                if cmd_trim == "back" {
+                    self.screen = Screen::Pokedex;
+                }
+            }
+            Screen::Game => {
+                if cmd_trim == "catch" && self.state == GameState::Idle {
+                    self.state = GameState::Throwing;
+                    self.frame_count = 0;
+                    self.capture_recorded = false;
+                }
+                if cmd_trim == "pokedex" || cmd_trim == "dex" {
+                    self.screen = Screen::Pokedex;
+                    self.pokedex_detail = None;
+                    self.pokedex_notice = None;
+                    self.pokedex_notice_timer = 0;
+                }
+            }
+        }
+        CommandAction::None
+    }
+
+    async fn update(&mut self, assets: &Assets) {
+        if let Screen::Game = self.screen {
+            match self.state {
+                GameState::Idle => {
+                    self.frame_count = self.frame_count.saturating_add(1);
+                    if self.frame_count > 60 {
+                        self.frame_count = 0;
+                    }
+                }
+                GameState::Throwing => {
+                    self.ball_x += 1.5;
+                    self.ball_y = self.floor_y + (self.ball_x * 0.5).sin() * 0.5;
+
+                    if self.ball_x > 12.0 {
+                        self.state = GameState::Opening;
+                        self.ball_x = 15.0;
+                        self.ball_y = self.floor_y;
+                        self.capture_recorded = false;
+                        self.capture_frame = 0;
+                        self.open_amount = 0.0;
+                        self.align_start_a = self.a;
+                        let grow_start_y = 5;
+                        let grow_start_x = (self.width / 2) - 2;
+                        let ball_center_x = self.width as f32 / 2.0 + self.ball_x;
+                        let ball_center_y = self.height as f32 / 2.0 + self.ball_y;
+                        self.stream_particles = build_stream_particles(
+                            self.pokemon(assets),
+                            grow_start_x,
+                            grow_start_y,
+                            ball_center_x,
+                            ball_center_y,
+                        );
+                    }
+                }
+                GameState::Opening => {
+                    self.capture_frame = self.capture_frame.saturating_add(1);
+                    let t = (self.capture_frame as f32 / OPEN_FRAMES as f32).min(1.0);
+                    self.open_amount = t;
+                    self.a = self.align_start_a * (1.0 - t);
+                    self.ball_x = 15.0;
+                    self.ball_y = self.floor_y;
+                    if self.capture_frame >= OPEN_FRAMES {
+                        self.state = GameState::Absorbing;
+                        self.capture_frame = 0;
+                    }
+                }
+                GameState::Absorbing => {
+                    self.capture_frame = self.capture_frame.saturating_add(1);
+                    self.open_amount = 1.0;
+                    self.ball_x = 15.0;
+                    self.ball_y = self.floor_y;
+                    if self.capture_frame >= ABSORB_FRAMES {
+                        self.state = GameState::Closing;
+                        self.capture_frame = 0;
+                        if !self.capture_recorded {
+                            if let Some(name) = self.trainer_name.as_ref() {
+                                if self.pokedex.insert(self.pokemon(assets).name.to_string()) {
+                                    let _ = save_pokedex(name, &self.pokedex).await;
+                                }
+                            }
+                            self.capture_recorded = true;
+                        }
+                    }
+                }
+                GameState::Closing => {
+                    self.capture_frame = self.capture_frame.saturating_add(1);
+                    let t = self.capture_frame as f32 / CLOSE_FRAMES as f32;
+                    self.open_amount = (1.0 - t).max(0.0);
+                    self.ball_x = 15.0;
+                    self.ball_y = self.floor_y;
+                    if self.capture_frame >= CLOSE_FRAMES {
+                        self.state = GameState::Shaking;
+                        self.shake_frame = 0;
+                        self.shake_count = 0;
+                        self.open_amount = 0.0;
+                    }
+                }
+                GameState::Shaking => {
+                    self.shake_frame = self.shake_frame.saturating_add(1);
+                    let phase = (self.shake_frame as f32 / SHAKE_FRAMES as f32)
+                        * std::f32::consts::PI
+                        * 2.0;
+                    let wobble = phase.sin() * 1.3;
+                    self.ball_x = 15.0 + wobble;
+                    self.ball_y = self.floor_y;
+                    if self.shake_frame >= SHAKE_FRAMES {
+                        self.shake_frame = 0;
+                        self.shake_count = self.shake_count.saturating_add(1);
+                        if self.shake_count >= SHAKE_COUNT {
+                            self.star_frame = STAR_FRAMES;
+                            self.star_hold = 45;
+                            self.state = GameState::StarHold;
+                            self.caught_message = Some(format!(
+                                "{} Caught!",
+                                display_pokemon_name(self.pokemon(assets).name)
+                            ));
+                            self.caught_message_timer = 45;
+                        }
+                    }
+                }
+                GameState::StarHold => {
+                    self.ball_x = 15.0;
+                    self.ball_y = self.floor_y;
+                    if self.star_hold > 0 {
+                        self.star_hold = self.star_hold.saturating_sub(1);
+                        if self.caught_message_timer > 0 {
+                            self.caught_message_timer = self.caught_message_timer.saturating_sub(1);
+                        }
+                    } else {
+                        self.state = GameState::Idle;
+                        self.ball_x = -45.0;
+                        self.ball_y = self.floor_y;
+                        self.frame_count = 0;
+                        self.open_amount = 0.0;
+                        self.stream_particles.clear();
+                        self.caught_message = None;
+                        self.caught_message_timer = 0;
+                    }
+                }
+            }
+        }
+
+        match self.screen {
+            Screen::Name => {
+                self.welcome_accum += 30;
+                if self.welcome_accum >= self.welcome_frame_ms {
+                    self.welcome_accum = 0;
+                    if !assets.arcanine_frames.is_empty() {
+                        self.welcome_frame = (self.welcome_frame + 1) % assets.arcanine_frames.len();
+                    }
+                }
+            }
+            Screen::Pokedex => {
+                if self.pokedex_notice_timer > 0 {
+                    self.pokedex_notice_timer = self.pokedex_notice_timer.saturating_sub(1);
+                    if self.pokedex_notice_timer == 0 {
+                        self.pokedex_notice = None;
+                    }
+                }
+            }
+            Screen::PokedexDetail => {}
+            Screen::Game => {
+                if self.state == GameState::Throwing {
+                    self.a -= 0.2;
+                } else if self.state == GameState::Idle {
+                    self.a -= 0.05;
+                }
+                self.tilt_phase += 0.04;
+            }
+        }
+    }
+
+    fn render(&mut self, assets: &Assets, buffers: &mut RenderBuffers) {
+        buffers.clear();
+        let output = &mut buffers.output;
+        let zbuffer = &mut buffers.zbuffer;
+        let color_buf = &mut buffers.color_buf;
+        let reset = "\x1b[0m";
+        let red = "\x1b[91m";
+        let white = "\x1b[97m";
+        let black = "\x1b[30m";
+
+        match self.screen {
+            Screen::Name => {
+                if !assets.arcanine_frames.is_empty() {
+                    let frame = &assets.arcanine_frames[self.welcome_frame % assets.arcanine_frames.len()];
+                    let start_x = (self.width.saturating_sub(frame.width)) / 2;
+                    let start_y = (self.height.saturating_sub(frame.height)) / 2;
+
+                    for y in 0..frame.height {
+                        for x in 0..frame.width {
+                            let target_y = start_y + y;
+                            let target_x = start_x + x;
+                            if target_y < self.height && target_x < self.width {
+                                let src_idx = x + y * frame.width;
+                                let ch = frame.chars[src_idx];
+                                if ch != ' ' {
+                                    let idx = target_x + target_y * self.width;
+                                    output[idx] = ch;
+                                    let (r, g, b) = frame.colors[src_idx];
+                                    color_buf[idx] = CellColor::Rgb(r, g, b);
+                                    zbuffer[idx] = 0.2;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Screen::Pokedex => {
+                render_pokedex(
+                    &assets.pokedex,
+                    &self.pokedex,
+                    output,
+                    color_buf,
+                    zbuffer,
+                    self.width,
+                    self.height,
+                );
+            }
+            Screen::PokedexDetail => {
+                if let Some(detail) = self.pokedex_detail {
+                    render_pokedex_detail(
+                        assets,
+                        detail,
+                        output,
+                        color_buf,
+                        zbuffer,
+                        self.width,
+                        self.height,
+                    );
+                }
+            }
+            Screen::Game => {
+                let pokemon = self.pokemon(assets);
+                if matches!(self.state, GameState::Idle | GameState::Throwing | GameState::Opening) {
+                    let grow_start_y = 5;
+                    let grow_start_x = (self.width / 2) - 2;
+
+                    for y in 0..pokemon.image.height {
+                        for x in 0..pokemon.image.width {
+                            let target_y = grow_start_y + y;
+                            let target_x = grow_start_x + x;
+                            if target_y < self.height && target_x < self.width {
+                                let src_idx = x + y * pokemon.image.width;
+                                let ch = pokemon.image.chars[src_idx];
+                                if ch != ' ' {
+                                    let idx = target_x + target_y * self.width;
+                                    output[idx] = ch;
+                                    let (r, g, b) = pokemon.image.colors[src_idx];
+                                    color_buf[idx] = CellColor::Rgb(r, g, b);
+                                    zbuffer[idx] = 0.4;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if self.state == GameState::Absorbing {
+                    render_stream(
+                        &self.stream_particles,
+                        self.capture_frame,
+                        output,
+                        color_buf,
+                        zbuffer,
+                        self.width,
+                        self.height,
+                    );
+                }
+
+                let cos_a = self.a.cos();
+                let sin_a = self.a.sin();
+                let tilt = 0.25 + 0.1 * self.tilt_phase.sin();
+                let cos_b = tilt.cos();
+                let sin_b = tilt.sin();
+                let (mut lx, mut ly, mut lz) = (-0.6_f32, 0.4_f32, -1.0_f32);
+                let l_len = (lx * lx + ly * ly + lz * lz).sqrt();
+                lx /= l_len;
+                ly /= l_len;
+                lz /= l_len;
+
+                let mut phi: f32 = 0.0;
+                while phi < 6.28 {
+                    let mut theta: f32 = 0.0;
+                    while theta < 3.14 {
+                        let ox = theta.sin() * phi.cos();
+                        let oy = theta.cos();
+                        let oz = theta.sin() * phi.sin();
+
+                        let mut pixel_char = '.';
+                        let pixel_color;
+                        let dist_to_button = ox * ox + oy * oy + (oz - 1.0) * (oz - 1.0);
+                        let band = oy.abs() < 0.06;
+
+                        if dist_to_button < 0.10 {
+                            pixel_color = black;
+                            pixel_char = '#';
+                        } else if dist_to_button < 0.18 {
+                            pixel_color = white;
+                            pixel_char = '@';
+                        } else if band {
+                            pixel_color = black;
+                            pixel_char = '#';
+                        } else if oy < 0.0 {
+                            pixel_color = red;
+                        } else {
+                            pixel_color = white;
+                        }
+
+                        let r = self.ball_scale;
+                        let x = (ox * cos_a - oy * sin_a) * r;
+                        let y = (ox * sin_a + oy * cos_a) * r;
+                        let z = oz * r;
+
+                        let mut y_final = y * cos_b - z * sin_b;
+                        let z_final = y * sin_b + z * cos_b;
+                        let x_final = x;
+                        if self.open_amount > 0.0 && oy > 0.02 {
+                            y_final += self.open_amount * 0.6;
+                        }
+                        if self.open_amount > 0.0 && oy.abs() < 0.03 {
+                            theta += 0.03;
+                            continue;
+                        }
+
+                        let camera_dist = 3.0;
+                        let ooz = 1.0 / (z_final + camera_dist);
+
+                        let xp = (self.width as f32 / 2.0
+                            + self.ball_x
+                            + 30.0 * ooz * x_final * self.aspect_ratio) as i32;
+                        let yp = (self.height as f32 / 2.0
+                            + self.ball_y
+                            + 18.0 * ooz * y_final) as i32;
+
+                        if xp >= 0 && xp < self.width as i32 && yp >= 0 && yp < self.height as i32 {
+                            let idx = (xp + yp * self.width as i32) as usize;
+                            if ooz > zbuffer[idx] {
+                                zbuffer[idx] = ooz;
+
+                                if pixel_char == '@' || pixel_char == '#' {
+                                    output[idx] = pixel_char;
+                                } else {
+                                    let dot = x_final * lx + y_final * ly + z_final * lz;
+                                    let diffuse = dot.max(0.0);
+                                    let rz = 2.0 * dot * z_final - lz;
+                                    let spec = (rz * -1.0).max(0.0).powf(16.0);
+                                    let shade = (0.12 + diffuse * 0.9 + spec * 0.6).min(1.0);
+
+                                    let mut l_idx = (shade * (self.chars.len() - 1) as f32) as usize;
+                                    if l_idx >= self.chars.len() {
+                                        l_idx = self.chars.len() - 1;
+                                    }
+                                    output[idx] = self.chars.chars().nth(l_idx).unwrap();
+                                }
+                                color_buf[idx] = CellColor::Ansi(pixel_color);
+                            }
+                        }
+                        theta += 0.03;
+                    }
+                    phi += 0.03;
+                }
+            }
+        }
+
+        if let Screen::Game = self.screen {
+            if self.star_frame > 0 {
+                render_starburst(
+                    self.width as i32,
+                    self.height as i32,
+                    self.ball_x,
+                    self.ball_y,
+                    output,
+                    color_buf,
+                    zbuffer,
+                    self.star_frame,
+                );
+                self.star_frame = self.star_frame.saturating_sub(1);
+            }
+        }
+
+        if let Screen::Pokedex = self.screen {
+            if let Some(notice) = self.pokedex_notice.as_ref() {
+                if self.pokedex_notice_timer > 0 {
+                    let row = self.height.saturating_sub(3);
+                    let start_x = (self.width.saturating_sub(notice.len())) / 2;
+                    for (i, ch) in notice.chars().enumerate() {
+                        let x = start_x + i;
+                        if x >= self.width || row >= self.height {
+                            continue;
+                        }
+                        let idx = x + row * self.width;
+                        output[idx] = ch;
+                        color_buf[idx] = CellColor::Ansi("\x1b[91m");
+                        zbuffer[idx] = 0.4;
+                    }
+                }
+            }
+        }
+
+        if let Screen::Game = self.screen {
+            if let Some(message) = self.caught_message.as_ref() {
+                if self.caught_message_timer > 0 {
+                    let row = self.height.saturating_sub(3);
+                    let start_x = (self.width.saturating_sub(message.len())) / 2;
+                    for (i, ch) in message.chars().enumerate() {
+                        let x = start_x + i;
+                        if x >= self.width || row >= self.height {
+                            continue;
+                        }
+                        let idx = x + row * self.width;
+                        output[idx] = ch;
+                        color_buf[idx] = CellColor::Ansi("\x1b[92m");
+                        zbuffer[idx] = 0.5;
+                    }
+                }
+            }
+        }
+
+        let prompt = match self.screen {
+            Screen::Name => "trainer name + Enter",
+            Screen::Pokedex => "number + Enter or 'back' + Enter",
+            Screen::PokedexDetail => "type 'back' + Enter",
+            Screen::Game => "type 'catch' + Enter or 'pokedex' + Enter",
+        };
+        let prompt_line = format!("command: {} ({})", self.last_cmd, prompt);
+        let prompt_row = self.height.saturating_sub(1);
+        for x in 0..self.width {
+            let idx = x + prompt_row * self.width;
+            output[idx] = ' ';
+            color_buf[idx] = CellColor::None;
+        }
+        for (x, ch) in prompt_line.chars().take(self.width).enumerate() {
+            let idx = x + prompt_row * self.width;
+            output[idx] = ch;
+        }
+
+        let _ = reset;
+    }
+
+    fn compose_frame(&self, buffers: &RenderBuffers) -> String {
+        let reset = "\x1b[0m";
+        let mut frame = String::with_capacity(self.width * self.height * 6);
+        frame.push_str("\x1b[H");
+        for i in 0..self.height {
+            for j in 0..self.width {
+                let idx = j + i * self.width;
+                if buffers.output[idx] == ' ' {
+                    frame.push(' ');
+                } else {
+                    match buffers.color_buf[idx] {
+                        CellColor::None => frame.push(buffers.output[idx]),
+                        CellColor::Ansi(code) => {
+                            frame.push_str(code);
+                            frame.push(buffers.output[idx]);
+                            frame.push_str(reset);
+                        }
+                        CellColor::Rgb(r, g, b) => {
+                            match self.color_mode {
+                                ColorMode::Truecolor => {
+                                    let _ = write!(
+                                        frame,
+                                        "\x1b[38;2;{};{};{}m{}",
+                                        r,
+                                        g,
+                                        b,
+                                        buffers.output[idx]
+                                    );
+                                    frame.push_str(reset);
+                                }
+                                ColorMode::Ansi256 => {
+                                    let code = rgb_to_ansi256(r, g, b);
+                                    let _ = write!(frame, "\x1b[38;5;{}m{}", code, buffers.output[idx]);
+                                    frame.push_str(reset);
+                                }
+                                ColorMode::Mono => {
+                                    frame.push(buffers.output[idx]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if i + 1 < self.height {
+                frame.push('\n');
+            }
+        }
+        let _ = write!(frame, "\x1b[{};1H\x1b[J", self.height + 1);
+        frame
+    }
+}
 const GEN1_CSV: &str = "sample_images/gen01.csv";
 const POKEDEX_COLS: usize = 15;
 const POKEDEX_ROWS: usize = 11;
@@ -186,471 +831,35 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
 
     let width = env_usize("POKESTREAM_WIDTH").unwrap_or(140);
     let height = env_usize("POKESTREAM_HEIGHT").unwrap_or(40);
-    let aspect_ratio = 1.5;
-
-    let chars = " .:-=+*#%@";
-    let pokemon = pick_pokemon(&assets.pokemons);
-    let mut trainer_name: Option<String> = None;
-    let mut pokedex: HashSet<String> = HashSet::new();
-    let arcanine_frames = &assets.arcanine_frames;
-    let pokedex_view = &assets.pokedex;
-
-    let reset = "\x1b[0m";
-    let red = "\x1b[91m";
-    let white = "\x1b[97m";
-    let black = "\x1b[30m";
     let color_mode = color_mode_from_env();
-
-    let mut state = GameState::Idle;
-    let mut frame_count = 0;
-    let mut capture_recorded = false;
-    let mut open_amount: f32 = 0.0;
-    let mut capture_frame: u16 = 0;
-    let mut shake_frame: u16 = 0;
-    let mut shake_count: u8 = 0;
-    let mut star_frame: u16 = 0;
-    let mut star_hold: u16 = 0;
-    let mut stream_particles: Vec<StreamParticle> = Vec::new();
-    let mut align_start_a: f32 = 0.0;
-
-    let floor_y: f32 = 5.0;
-
-    let mut ball_x: f32 = -45.0;
-    let mut ball_y: f32 = floor_y;
-    let ball_scale: f32 = 1.0;
-    let mut a: f32 = 0.0;
-    let mut tilt_phase: f32 = 0.0;
-
-    let mut last_cmd = String::new();
-    let mut screen = Screen::Name;
-    let mut welcome_frame = 0usize;
-    let mut welcome_accum = 0u64;
-    let welcome_frame_ms: u64 = 1000 / 12;
+    let mut session = SessionState::new(width, height, color_mode, &assets);
+    let mut buffers = RenderBuffers::new(width, height);
 
     write_half.write_all(b"\x1b[2J\x1b[H\x1b[?25l").await?;
 
     loop {
-        let mut output: Vec<char> = vec![' '; width * height];
-        let mut zbuffer: Vec<f32> = vec![-99.0; width * height];
-        let mut color_buf: Vec<CellColor> = vec![CellColor::None; width * height];
-
         while let Ok(cmd) = cmd_rx.try_recv() {
-            let cmd_trim = cmd.trim().to_lowercase();
-            if cmd.as_bytes().contains(&3) || matches!(cmd_trim.as_str(), "q" | "quit" | "exit") {
-                reader_task.abort();
-                let _ = reader_task.await;
-                let _ = close_session(&mut write_half).await;
-                return Ok(());
-            }
-            if cmd_trim == "__disconnect__" {
-                reader_task.abort();
-                let _ = reader_task.await;
-                let _ = cleanup_terminal(&mut write_half).await;
-                return Ok(());
-            }
-            last_cmd = cmd_trim.clone();
-            match screen {
-                Screen::Name => {
-                    if let Some(name) = sanitize_trainer_name(&cmd_trim) {
-                        pokedex = load_pokedex(&name).await.unwrap_or_default();
-                        trainer_name = Some(name);
-                        screen = Screen::Game;
-                    }
+            match session.handle_command(&cmd, &assets).await {
+                CommandAction::Exit => {
+                    reader_task.abort();
+                    let _ = reader_task.await;
+                    let _ = close_session(&mut write_half).await;
+                    return Ok(());
                 }
-                Screen::Pokedex => {
-                    if cmd_trim == "back" {
-                        screen = Screen::Game;
-                    }
+                CommandAction::Disconnect => {
+                    reader_task.abort();
+                    let _ = reader_task.await;
+                    let _ = cleanup_terminal(&mut write_half).await;
+                    return Ok(());
                 }
-                Screen::Game => {
-                    if cmd_trim == "catch" && state == GameState::Idle {
-                        state = GameState::Throwing;
-                        frame_count = 0;
-                        capture_recorded = false;
-                    }
-                    if cmd_trim == "pokedex" || cmd_trim == "dex" {
-                        screen = Screen::Pokedex;
-                    }
-                }
+                CommandAction::None => {}
             }
         }
 
-        if let Screen::Game = screen {
-            match state {
-                GameState::Idle => {
-                    frame_count += 1;
-                    if frame_count > 60 {
-                        frame_count = 0;
-                    }
-                }
-                GameState::Throwing => {
-                    ball_x += 1.5;
-                    ball_y = floor_y + (ball_x * 0.5).sin() * 0.5;
-
-                    if ball_x > 12.0 {
-                        state = GameState::Opening;
-                        ball_x = 15.0;
-                        ball_y = floor_y;
-                        capture_recorded = false;
-                        capture_frame = 0;
-                        open_amount = 0.0;
-                        align_start_a = a;
-                        let grow_start_y = 5;
-                        let grow_start_x = (width / 2) - 2;
-                        let ball_center_x = width as f32 / 2.0 + ball_x;
-                        let ball_center_y = height as f32 / 2.0 + ball_y;
-                        stream_particles = build_stream_particles(
-                            pokemon,
-                            grow_start_x,
-                            grow_start_y,
-                            ball_center_x,
-                            ball_center_y,
-                        );
-                    }
-                }
-                GameState::Opening => {
-                    capture_frame = capture_frame.saturating_add(1);
-                    let t = (capture_frame as f32 / OPEN_FRAMES as f32).min(1.0);
-                    open_amount = t;
-                    a = align_start_a * (1.0 - t);
-                    ball_x = 15.0;
-                    ball_y = floor_y;
-                    if capture_frame >= OPEN_FRAMES {
-                        state = GameState::Absorbing;
-                        capture_frame = 0;
-                    }
-                }
-                GameState::Absorbing => {
-                    capture_frame = capture_frame.saturating_add(1);
-                    open_amount = 1.0;
-                    ball_x = 15.0;
-                    ball_y = floor_y;
-                    if capture_frame >= ABSORB_FRAMES {
-                        state = GameState::Closing;
-                        capture_frame = 0;
-                        if !capture_recorded {
-                            if let Some(name) = trainer_name.as_ref() {
-                                if pokedex.insert(pokemon.name.to_string()) {
-                                    let _ = save_pokedex(name, &pokedex).await;
-                                }
-                            }
-                            capture_recorded = true;
-                        }
-                    }
-                }
-                GameState::Closing => {
-                    capture_frame = capture_frame.saturating_add(1);
-                    let t = capture_frame as f32 / CLOSE_FRAMES as f32;
-                    open_amount = (1.0 - t).max(0.0);
-                    ball_x = 15.0;
-                    ball_y = floor_y;
-                    if capture_frame >= CLOSE_FRAMES {
-                        state = GameState::Shaking;
-                        shake_frame = 0;
-                        shake_count = 0;
-                        open_amount = 0.0;
-                    }
-                }
-                GameState::Shaking => {
-                    shake_frame = shake_frame.saturating_add(1);
-                    let phase = (shake_frame as f32 / SHAKE_FRAMES as f32) * std::f32::consts::PI * 2.0;
-                    let wobble = phase.sin() * 1.3;
-                    ball_x = 15.0 + wobble;
-                    ball_y = floor_y;
-                    if shake_frame >= SHAKE_FRAMES {
-                        shake_frame = 0;
-                        shake_count = shake_count.saturating_add(1);
-                        if shake_count >= SHAKE_COUNT {
-                            star_frame = STAR_FRAMES;
-                            star_hold = 30;
-                            state = GameState::StarHold;
-                        }
-                    }
-                }
-                GameState::StarHold => {
-                    ball_x = 15.0;
-                    ball_y = floor_y;
-                    if star_hold > 0 {
-                        star_hold = star_hold.saturating_sub(1);
-                    } else {
-                        state = GameState::Idle;
-                        ball_x = -45.0;
-                        ball_y = floor_y;
-                        frame_count = 0;
-                        open_amount = 0.0;
-                        stream_particles.clear();
-                    }
-                }
-            }
-        }
-
-        match screen {
-            Screen::Name => {
-                if !arcanine_frames.is_empty() {
-                    let frame = &arcanine_frames[welcome_frame % arcanine_frames.len()];
-                    let start_x = (width.saturating_sub(frame.width)) / 2;
-                    let start_y = (height.saturating_sub(frame.height)) / 2;
-
-                    for y in 0..frame.height {
-                        for x in 0..frame.width {
-                            let target_y = start_y + y;
-                            let target_x = start_x + x;
-                            if target_y < height && target_x < width {
-                                let src_idx = x + y * frame.width;
-                                let ch = frame.chars[src_idx];
-                                if ch != ' ' {
-                                    let idx = target_x + target_y * width;
-                                    output[idx] = ch;
-                                    let (r, g, b) = frame.colors[src_idx];
-                                    color_buf[idx] = CellColor::Rgb(r, g, b);
-                                    zbuffer[idx] = 0.2;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Screen::Pokedex => {
-                render_pokedex(
-                    pokedex_view,
-                    &pokedex,
-                    &mut output,
-                    &mut color_buf,
-                    &mut zbuffer,
-                    width,
-                    height,
-                );
-            }
-            Screen::Game => {
-                if matches!(state, GameState::Idle | GameState::Throwing | GameState::Opening) {
-                    let grow_start_y = 5;
-                    let grow_start_x = (width / 2) - 2;
-
-                    for y in 0..pokemon.image.height {
-                        for x in 0..pokemon.image.width {
-                            let target_y = grow_start_y + y;
-                            let target_x = grow_start_x + x;
-                            if target_y < height && target_x < width {
-                                let src_idx = x + y * pokemon.image.width;
-                                let ch = pokemon.image.chars[src_idx];
-                                if ch != ' ' {
-                                    let idx = target_x + target_y * width;
-                                    output[idx] = ch;
-                                    let (r, g, b) = pokemon.image.colors[src_idx];
-                                    color_buf[idx] = CellColor::Rgb(r, g, b);
-                                    zbuffer[idx] = 0.4;
-                                }
-                            }
-                        }
-                    }
-                }
-                if state == GameState::Absorbing {
-                    render_stream(
-                        &stream_particles,
-                        capture_frame,
-                        &mut output,
-                        &mut color_buf,
-                        &mut zbuffer,
-                        width,
-                        height,
-                    );
-                }
-
-                let cos_a = a.cos();
-                let sin_a = a.sin();
-                let tilt = 0.25 + 0.1 * tilt_phase.sin();
-                let cos_b = tilt.cos();
-                let sin_b = tilt.sin();
-                let (mut lx, mut ly, mut lz) = (-0.6_f32, 0.4_f32, -1.0_f32);
-                let l_len = (lx * lx + ly * ly + lz * lz).sqrt();
-                lx /= l_len;
-                ly /= l_len;
-                lz /= l_len;
-
-                let mut phi: f32 = 0.0;
-                while phi < 6.28 {
-                    let mut theta: f32 = 0.0;
-                    while theta < 3.14 {
-                        let ox = theta.sin() * phi.cos();
-                        let oy = theta.cos();
-                        let oz = theta.sin() * phi.sin();
-
-                        let mut pixel_char = '.';
-                        let pixel_color;
-                        let dist_to_button = ox * ox + oy * oy + (oz - 1.0) * (oz - 1.0);
-                        let band = oy.abs() < 0.06;
-
-                        if dist_to_button < 0.10 {
-                            pixel_color = black;
-                            pixel_char = '#';
-                        } else if dist_to_button < 0.18 {
-                            pixel_color = white;
-                            pixel_char = '@';
-                        } else if band {
-                            pixel_color = black;
-                            pixel_char = '#';
-                        } else if oy < 0.0 {
-                            pixel_color = red;
-                        } else {
-                            pixel_color = white;
-                        }
-
-                        let r = ball_scale;
-                        let x = (ox * cos_a - oy * sin_a) * r;
-                        let y = (ox * sin_a + oy * cos_a) * r;
-                        let z = oz * r;
-
-                        let mut y_final = y * cos_b - z * sin_b;
-                        let z_final = y * sin_b + z * cos_b;
-                        let x_final = x;
-                        if open_amount > 0.0 && oy > 0.02 {
-                            y_final += open_amount * 0.6;
-                        }
-                        if open_amount > 0.0 && oy.abs() < 0.03 {
-                            theta += 0.03;
-                            continue;
-                        }
-
-                        let camera_dist = 3.0;
-                        let ooz = 1.0 / (z_final + camera_dist);
-
-                        let xp =
-                            (width as f32 / 2.0 + ball_x + 30.0 * ooz * x_final * aspect_ratio)
-                                as i32;
-                        let yp = (height as f32 / 2.0 + ball_y + 18.0 * ooz * y_final) as i32;
-
-                        if xp >= 0 && xp < width as i32 && yp >= 0 && yp < height as i32 {
-                            let idx = (xp + yp * width as i32) as usize;
-                            if ooz > zbuffer[idx] {
-                                zbuffer[idx] = ooz;
-
-                                if pixel_char == '@' || pixel_char == '#' {
-                                    output[idx] = pixel_char;
-                                } else {
-                                    let dot = x_final * lx + y_final * ly + z_final * lz;
-                                    let diffuse = dot.max(0.0);
-                                    let rz = 2.0 * dot * z_final - lz;
-                                    let spec = (rz * -1.0).max(0.0).powf(16.0);
-                                    let shade = (0.12 + diffuse * 0.9 + spec * 0.6).min(1.0);
-
-                                    let mut l_idx = (shade * (chars.len() - 1) as f32) as usize;
-                                    if l_idx >= chars.len() {
-                                        l_idx = chars.len() - 1;
-                                    }
-                                    output[idx] = chars.chars().nth(l_idx).unwrap();
-                                }
-                                color_buf[idx] = CellColor::Ansi(pixel_color);
-                            }
-                        }
-                        theta += 0.03;
-                    }
-                    phi += 0.03;
-                }
-
-            }
-        }
-
-        let prompt = match screen {
-            Screen::Name => "trainer name + Enter",
-            Screen::Pokedex => "type 'back' + Enter",
-            Screen::Game => "type 'catch' + Enter",
-        };
-        let prompt_line = format!("command: {} ({})", last_cmd, prompt);
-        let prompt_row = height.saturating_sub(1);
-        for x in 0..width {
-            let idx = x + prompt_row * width;
-            output[idx] = ' ';
-            color_buf[idx] = CellColor::None;
-        }
-        for (x, ch) in prompt_line.chars().take(width).enumerate() {
-            let idx = x + prompt_row * width;
-            output[idx] = ch;
-        }
-
-        if let Screen::Game = screen {
-            if star_frame > 0 {
-                render_starburst(
-                    width as i32,
-                    height as i32,
-                    ball_x,
-                    ball_y,
-                    &mut output,
-                    &mut color_buf,
-                    &mut zbuffer,
-                    star_frame,
-                );
-                star_frame = star_frame.saturating_sub(1);
-            }
-        }
-
-        let mut frame = String::with_capacity(width * height * 6);
-        frame.push_str("\x1b[H");
-        for i in 0..height {
-            for j in 0..width {
-                let idx = j + i * width;
-                if output[idx] == ' ' {
-                    frame.push(' ');
-                } else {
-                    match color_buf[idx] {
-                        CellColor::None => frame.push(output[idx]),
-                        CellColor::Ansi(code) => {
-                            frame.push_str(code);
-                            frame.push(output[idx]);
-                            frame.push_str(reset);
-                        }
-                        CellColor::Rgb(r, g, b) => {
-                            match color_mode {
-                                ColorMode::Truecolor => {
-                                    let _ = write!(
-                                        frame,
-                                        "\x1b[38;2;{};{};{}m{}",
-                                        r,
-                                        g,
-                                        b,
-                                        output[idx]
-                                    );
-                                    frame.push_str(reset);
-                                }
-                                ColorMode::Ansi256 => {
-                                    let code = rgb_to_ansi256(r, g, b);
-                                    let _ = write!(frame, "\x1b[38;5;{}m{}", code, output[idx]);
-                                    frame.push_str(reset);
-                                }
-                                ColorMode::Mono => {
-                                    frame.push(output[idx]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if i + 1 < height {
-                frame.push('\n');
-            }
-        }
-        let _ = write!(frame, "\x1b[{};1H\x1b[J", height + 1);
+        session.update(&assets).await;
+        session.render(&assets, &mut buffers);
+        let frame = session.compose_frame(&buffers);
         write_half.write_all(frame.as_bytes()).await?;
-
-        match screen {
-            Screen::Name => {
-                welcome_accum += 30;
-                if welcome_accum >= welcome_frame_ms {
-                    welcome_accum = 0;
-                    if !arcanine_frames.is_empty() {
-                        welcome_frame = (welcome_frame + 1) % arcanine_frames.len();
-                    }
-                }
-            }
-            Screen::Pokedex => {}
-            Screen::Game => {
-                if state == GameState::Throwing {
-                    a -= 0.2;
-                } else if state == GameState::Idle {
-                    a -= 0.05;
-                }
-                tilt_phase += 0.04;
-            }
-        }
 
         time::sleep(Duration::from_millis(30)).await;
     }
@@ -830,7 +1039,7 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     16 + 36 * rc + 6 * gc + bc
 }
 
-fn pick_pokemon(pokemons: &[PokemonAsset]) -> &PokemonAsset {
+fn pick_pokemon_index(pokemons: &[PokemonAsset]) -> usize {
     if pokemons.is_empty() {
         panic!("no pokemon assets loaded");
     }
@@ -838,8 +1047,7 @@ fn pick_pokemon(pokemons: &[PokemonAsset]) -> &PokemonAsset {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let idx = (nanos % pokemons.len() as u128) as usize;
-    &pokemons[idx]
+    (nanos % pokemons.len() as u128) as usize
 }
 
 fn load_pokedex_view() -> io::Result<PokedexView> {
@@ -915,6 +1123,25 @@ fn normalize_pokemon_name(name: &str, form: &str) -> String {
     base
 }
 
+fn display_pokemon_name(name: &str) -> String {
+    let mut out = String::new();
+    for (i, part) in name.split('-').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.push(first.to_ascii_uppercase());
+            out.extend(chars);
+        }
+    }
+    out
+}
+
+fn find_pokemon_asset<'a>(assets: &'a Assets, name: &str) -> Option<&'a PokemonAsset> {
+    assets.pokemons.iter().find(|asset| asset.name == name)
+}
+
 fn render_pokedex(
     view: &PokedexView,
     caught: &HashSet<String>,
@@ -954,6 +1181,94 @@ fn render_pokedex(
             output[idx] = *digit;
             color_buf[idx] = CellColor::Ansi(main);
             zbuffer[idx] = 0.35;
+        }
+    }
+}
+
+fn render_pokedex_detail(
+    assets: &Assets,
+    idx: usize,
+    output: &mut [char],
+    color_buf: &mut [CellColor],
+    zbuffer: &mut [f32],
+    width: usize,
+    height: usize,
+) {
+    let name = assets
+        .pokedex
+        .names
+        .get(idx)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let display_name = if name.is_empty() {
+        "Unknown Pokemon".to_string()
+    } else {
+        display_pokemon_name(name)
+    };
+
+    if let Some(asset) = find_pokemon_asset(assets, name) {
+        let image = &asset.image;
+        let start_x = (width.saturating_sub(image.width)) / 2;
+        let start_y = (height.saturating_sub(image.height + 2)) / 2;
+
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let target_y = start_y + y;
+                let target_x = start_x + x;
+                if target_y >= height || target_x >= width {
+                    continue;
+                }
+                let src_idx = x + y * image.width;
+                let ch = image.chars[src_idx];
+                if ch == ' ' {
+                    continue;
+                }
+                let idx = target_x + target_y * width;
+                output[idx] = ch;
+                let (r, g, b) = image.colors[src_idx];
+                color_buf[idx] = CellColor::Rgb(r, g, b);
+                zbuffer[idx] = 0.4;
+            }
+        }
+
+        let name_row = (start_y + image.height + 1).min(height.saturating_sub(2));
+        let name_start = (width.saturating_sub(display_name.len())) / 2;
+        for (i, ch) in display_name.chars().enumerate() {
+            let x = name_start + i;
+            if x >= width || name_row >= height {
+                continue;
+            }
+            let idx = x + name_row * width;
+            output[idx] = ch;
+            color_buf[idx] = CellColor::Ansi("\x1b[92m");
+            zbuffer[idx] = 0.4;
+        }
+    } else {
+        let notice = "Sprite not available yet";
+        let notice_row = height.saturating_sub(3);
+        let notice_start = (width.saturating_sub(notice.len())) / 2;
+        for (i, ch) in notice.chars().enumerate() {
+            let x = notice_start + i;
+            if x >= width || notice_row >= height {
+                continue;
+            }
+            let idx = x + notice_row * width;
+            output[idx] = ch;
+            color_buf[idx] = CellColor::Ansi("\x1b[97m");
+            zbuffer[idx] = 0.4;
+        }
+
+        let name_row = notice_row.saturating_sub(2);
+        let name_start = (width.saturating_sub(display_name.len())) / 2;
+        for (i, ch) in display_name.chars().enumerate() {
+            let x = name_start + i;
+            if x >= width || name_row >= height {
+                continue;
+            }
+            let idx = x + name_row * width;
+            output[idx] = ch;
+            color_buf[idx] = CellColor::Ansi("\x1b[92m");
+            zbuffer[idx] = 0.4;
         }
     }
 }
