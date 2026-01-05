@@ -78,7 +78,7 @@ impl RenderBuffers {
 }
 
 struct PokemonAsset {
-    name: &'static str,
+    name: String,
     image: ascii::AsciiImage,
 }
 
@@ -313,7 +313,7 @@ impl SessionState {
                         self.capture_frame = 0;
                         if !self.capture_recorded {
                             if let Some(name) = self.trainer_name.as_ref() {
-                                if self.pokedex.insert(self.pokemon(assets).name.to_string()) {
+                                if self.pokedex.insert(self.pokemon(assets).name.clone()) {
                                     let _ = save_pokedex(name, &self.pokedex).await;
                                 }
                             }
@@ -351,7 +351,7 @@ impl SessionState {
                             self.state = GameState::StarHold;
                             self.caught_message = Some(format!(
                                 "{} Caught!",
-                                display_pokemon_name(self.pokemon(assets).name)
+                                display_pokemon_name(&self.pokemon(assets).name)
                             ));
                             self.caught_message_timer = 45;
                         }
@@ -739,53 +739,9 @@ async fn main() -> io::Result<()> {
     let pokedex = load_pokedex_view().unwrap_or_else(|err| {
         panic!("failed to load pokedex assets: {err}");
     });
+    let pokemons = load_pokemon_assets(&pokedex.names, IMG_CHARSET);
     let assets = Arc::new(Assets {
-        pokemons: vec![
-            PokemonAsset {
-                name: "bulbasaur",
-                image: pokemon::load_bulbasaur(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "ivysaur",
-                image: pokemon::load_ivysaur(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "venusaur",
-                image: pokemon::load_venusaur(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "charmander",
-                image: pokemon::load_charmander(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "charmeleon",
-                image: pokemon::load_charmeleon(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "charizard",
-                image: pokemon::load_charizard(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "squirtle",
-                image: pokemon::load_squirtle(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "wartortle",
-                image: pokemon::load_wartortle(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "blastoise",
-                image: pokemon::load_blastoise(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "growlithe",
-                image: pokemon::load_growlithe(IMG_CHARSET),
-            },
-            PokemonAsset {
-                name: "pikachu",
-                image: pokemon::load_pikachu(IMG_CHARSET),
-            },
-        ],
+        pokemons,
         arcanine_frames: pokemon::load_arcanine_frames(IMG_CHARSET),
         pokedex,
     });
@@ -1055,6 +1011,21 @@ fn load_pokedex_view() -> io::Result<PokedexView> {
     Ok(PokedexView {
         names,
     })
+}
+
+fn load_pokemon_assets(names: &[String], charset: &str) -> Vec<PokemonAsset> {
+    let mut assets = Vec::new();
+    for name in names {
+        if name.is_empty() {
+            continue;
+        }
+        let image = pokemon::load_named_pokemon(name, charset);
+        assets.push(PokemonAsset {
+            name: name.clone(),
+            image,
+        });
+    }
+    assets
 }
 
 fn load_gen1_names(path: &str) -> io::Result<Vec<String>> {
