@@ -1,8 +1,8 @@
 # Poke-Stream
 
-Terminal-hosted Pokemon game with real-time ASCII animation. Players connect over Telnet to play and catch Pokemon while a 3D, ray-cast Pokeball animates over 2D Pokemon art, all rendered as colored ASCII characters. The server is written in Rust and uses Tokio to run one game loop per connection.
+![Arcanine animation](arcanine.gif)
 
-![Terminal screenshot](Screenshot%202026-01-04%20at%2016.34.54.png)
+Terminal-hosted Pokemon game with real-time ASCII animation. Players connect over Telnet to play and catch Pokemon while a 3D, ray-cast Pokeball animates over 2D Pokemon art, all rendered as colored ASCII characters. The server is written in Rust and uses Tokio to run one game loop per connection.
 
 ## Features
 - Telnet-playable game loop with a welcome screen and capture sequence.
@@ -24,17 +24,12 @@ If your terminal supports 24-bit color, set:
 POKESTREAM_COLOR=truecolor
 ```
 
-## Play (Local)
-```bash
-cargo run --release
-telnet localhost 8080
-```
-
 Recommended terminal size is at least 140x40.
 
 ## Controls
 - On connect: enter a unique trainer name
 - In game: type `catch` to throw the Pokeball
+- In game: type `pokedex` or `dex` to view your Pokedex
 - Exit the game: type `q`, `quit`, or `exit`
 
 ## Exiting Telnet
@@ -45,9 +40,11 @@ Press Ctrl + ]
 Type quit
 ```
 
+![Capture sequence](Screenshot%202026-01-04%20at%2016.34.54.png)
+
 ## Architecture Summary
 - **Server loop**: `src/main.rs` binds on `0.0.0.0:8080` and spawns a Tokio task per connection.
-- **Game states**: `Idle` (spin), `Throwing` (ball moves), `Caught` (pause and reset).
+- **Game states**: `Idle`, `Throwing`, `Opening`, `Absorbing`, `Closing`, `Shaking`, `StarHold`.
 - **Renderer**:
   - **2D layer**: ASCII Pokemon sprites with per-character color.
   - **3D layer**: Ray-cast sphere with shading, rim band, and button.
@@ -61,14 +58,6 @@ Color mode selection (optional):
 - `POKESTREAM_COLOR=mono` or `none`
 
 If unset, the server auto-detects color support via `COLORTERM` and `TERM`.
-
-## Assets
-The game uses image assets in `assets/pokemon/`:
-- `growlithe.jpg`
-- `pikachu.png`
-- `arcanine.gif` (welcome animation)
-
-The ASCII conversion pipeline handles resizing, background masking, shading, and per-character color mapping.
 
 ## Tech Stack
 - Rust (edition 2024)

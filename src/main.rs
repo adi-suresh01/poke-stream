@@ -6,6 +6,7 @@ use std::fmt::Write;
 use std::env;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
 
 use rusqlite::{Connection, OptionalExtension};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,7 +20,11 @@ use tokio::task;
 enum GameState {
     Idle,
     Throwing,
-    Caught,
+    Opening,
+    Absorbing,
+    Closing,
+    Shaking,
+    StarHold,
 }
 
 #[derive(Copy, Clone)]
@@ -32,10 +37,12 @@ enum CellColor {
 struct Assets {
     pokemons: Vec<PokemonAsset>,
     arcanine_frames: Vec<ascii::AsciiImage>,
+    pokedex: PokedexView,
 }
 
 enum Screen {
     Name,
+    Pokedex,
     Game,
 }
 
@@ -51,16 +58,80 @@ struct PokemonAsset {
     image: ascii::AsciiImage,
 }
 
+struct PokedexView {
+    names: Vec<String>,
+}
+
+struct StreamParticle {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    ch: char,
+    color: (u8, u8, u8),
+    start_frame: u16,
+}
+
 const IMG_CHARSET: &str =
     ".'`^\",:;Il!i><~+_-?][}{1)(|\\/*tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$Ñ";
 
 const DB_PATH: &str = "pokedex.db";
+const OPEN_FRAMES: u16 = 10;
+const ABSORB_FRAMES: u16 = 22;
+const CLOSE_FRAMES: u16 = 10;
+const SHAKE_FRAMES: u16 = 20;
+const SHAKE_COUNT: u8 = 3;
+const STAR_FRAMES: u16 = 18;
+const GEN1_CSV: &str = "sample_images/gen01.csv";
+const POKEDEX_COLS: usize = 15;
+const POKEDEX_ROWS: usize = 11;
+const POKEDEX_CELL_W: usize = 9;
+const POKEDEX_CELL_H: usize = 3;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     init_db().await?;
+    let pokedex = load_pokedex_view().unwrap_or_else(|err| {
+        panic!("failed to load pokedex assets: {err}");
+    });
     let assets = Arc::new(Assets {
         pokemons: vec![
+            PokemonAsset {
+                name: "bulbasaur",
+                image: pokemon::load_bulbasaur(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "ivysaur",
+                image: pokemon::load_ivysaur(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "venusaur",
+                image: pokemon::load_venusaur(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "charmander",
+                image: pokemon::load_charmander(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "charmeleon",
+                image: pokemon::load_charmeleon(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "charizard",
+                image: pokemon::load_charizard(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "squirtle",
+                image: pokemon::load_squirtle(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "wartortle",
+                image: pokemon::load_wartortle(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "blastoise",
+                image: pokemon::load_blastoise(IMG_CHARSET),
+            },
             PokemonAsset {
                 name: "growlithe",
                 image: pokemon::load_growlithe(IMG_CHARSET),
@@ -71,6 +142,7 @@ async fn main() -> io::Result<()> {
             },
         ],
         arcanine_frames: pokemon::load_arcanine_frames(IMG_CHARSET),
+        pokedex,
     });
 
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
@@ -121,6 +193,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let mut trainer_name: Option<String> = None;
     let mut pokedex: HashSet<String> = HashSet::new();
     let arcanine_frames = &assets.arcanine_frames;
+    let pokedex_view = &assets.pokedex;
 
     let reset = "\x1b[0m";
     let red = "\x1b[91m";
@@ -130,8 +203,15 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
 
     let mut state = GameState::Idle;
     let mut frame_count = 0;
-    let mut caught_timer = 0;
     let mut capture_recorded = false;
+    let mut open_amount: f32 = 0.0;
+    let mut capture_frame: u16 = 0;
+    let mut shake_frame: u16 = 0;
+    let mut shake_count: u8 = 0;
+    let mut star_frame: u16 = 0;
+    let mut star_hold: u16 = 0;
+    let mut stream_particles: Vec<StreamParticle> = Vec::new();
+    let mut align_start_a: f32 = 0.0;
 
     let floor_y: f32 = 5.0;
 
@@ -177,11 +257,19 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                         screen = Screen::Game;
                     }
                 }
+                Screen::Pokedex => {
+                    if cmd_trim == "back" {
+                        screen = Screen::Game;
+                    }
+                }
                 Screen::Game => {
                     if cmd_trim == "catch" && state == GameState::Idle {
                         state = GameState::Throwing;
                         frame_count = 0;
                         capture_recorded = false;
+                    }
+                    if cmd_trim == "pokedex" || cmd_trim == "dex" {
+                        screen = Screen::Pokedex;
                     }
                 }
             }
@@ -200,30 +288,97 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                     ball_y = floor_y + (ball_x * 0.5).sin() * 0.5;
 
                     if ball_x > 12.0 {
-                        state = GameState::Caught;
+                        state = GameState::Opening;
                         ball_x = 15.0;
                         ball_y = floor_y;
-                        caught_timer = 0;
                         capture_recorded = false;
+                        capture_frame = 0;
+                        open_amount = 0.0;
+                        align_start_a = a;
+                        let grow_start_y = 5;
+                        let grow_start_x = (width / 2) - 2;
+                        let ball_center_x = width as f32 / 2.0 + ball_x;
+                        let ball_center_y = height as f32 / 2.0 + ball_y;
+                        stream_particles = build_stream_particles(
+                            pokemon,
+                            grow_start_x,
+                            grow_start_y,
+                            ball_center_x,
+                            ball_center_y,
+                        );
                     }
                 }
-                GameState::Caught => {
-                    caught_timer += 1;
+                GameState::Opening => {
+                    capture_frame = capture_frame.saturating_add(1);
+                    let t = (capture_frame as f32 / OPEN_FRAMES as f32).min(1.0);
+                    open_amount = t;
+                    a = align_start_a * (1.0 - t);
                     ball_x = 15.0;
-                    if !capture_recorded {
-                        if let Some(name) = trainer_name.as_ref() {
-                            if pokedex.insert(pokemon.name.to_string()) {
-                                let _ = save_pokedex(name, &pokedex).await;
-                            }
-                        }
-                        capture_recorded = true;
+                    ball_y = floor_y;
+                    if capture_frame >= OPEN_FRAMES {
+                        state = GameState::Absorbing;
+                        capture_frame = 0;
                     }
-
-                    if caught_timer > 50 {
+                }
+                GameState::Absorbing => {
+                    capture_frame = capture_frame.saturating_add(1);
+                    open_amount = 1.0;
+                    ball_x = 15.0;
+                    ball_y = floor_y;
+                    if capture_frame >= ABSORB_FRAMES {
+                        state = GameState::Closing;
+                        capture_frame = 0;
+                        if !capture_recorded {
+                            if let Some(name) = trainer_name.as_ref() {
+                                if pokedex.insert(pokemon.name.to_string()) {
+                                    let _ = save_pokedex(name, &pokedex).await;
+                                }
+                            }
+                            capture_recorded = true;
+                        }
+                    }
+                }
+                GameState::Closing => {
+                    capture_frame = capture_frame.saturating_add(1);
+                    let t = capture_frame as f32 / CLOSE_FRAMES as f32;
+                    open_amount = (1.0 - t).max(0.0);
+                    ball_x = 15.0;
+                    ball_y = floor_y;
+                    if capture_frame >= CLOSE_FRAMES {
+                        state = GameState::Shaking;
+                        shake_frame = 0;
+                        shake_count = 0;
+                        open_amount = 0.0;
+                    }
+                }
+                GameState::Shaking => {
+                    shake_frame = shake_frame.saturating_add(1);
+                    let phase = (shake_frame as f32 / SHAKE_FRAMES as f32) * std::f32::consts::PI * 2.0;
+                    let wobble = phase.sin() * 1.3;
+                    ball_x = 15.0 + wobble;
+                    ball_y = floor_y;
+                    if shake_frame >= SHAKE_FRAMES {
+                        shake_frame = 0;
+                        shake_count = shake_count.saturating_add(1);
+                        if shake_count >= SHAKE_COUNT {
+                            star_frame = STAR_FRAMES;
+                            star_hold = 30;
+                            state = GameState::StarHold;
+                        }
+                    }
+                }
+                GameState::StarHold => {
+                    ball_x = 15.0;
+                    ball_y = floor_y;
+                    if star_hold > 0 {
+                        star_hold = star_hold.saturating_sub(1);
+                    } else {
                         state = GameState::Idle;
                         ball_x = -45.0;
                         ball_y = floor_y;
                         frame_count = 0;
+                        open_amount = 0.0;
+                        stream_particles.clear();
                     }
                 }
             }
@@ -255,10 +410,21 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                     }
                 }
             }
+            Screen::Pokedex => {
+                render_pokedex(
+                    pokedex_view,
+                    &pokedex,
+                    &mut output,
+                    &mut color_buf,
+                    &mut zbuffer,
+                    width,
+                    height,
+                );
+            }
             Screen::Game => {
-                if state != GameState::Caught {
+                if matches!(state, GameState::Idle | GameState::Throwing | GameState::Opening) {
                     let grow_start_y = 5;
-                    let grow_start_x = (width / 2) + 2;
+                    let grow_start_x = (width / 2) - 2;
 
                     for y in 0..pokemon.image.height {
                         for x in 0..pokemon.image.width {
@@ -277,6 +443,17 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                             }
                         }
                     }
+                }
+                if state == GameState::Absorbing {
+                    render_stream(
+                        &stream_particles,
+                        capture_frame,
+                        &mut output,
+                        &mut color_buf,
+                        &mut zbuffer,
+                        width,
+                        height,
+                    );
                 }
 
                 let cos_a = a.cos();
@@ -301,17 +478,18 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                         let mut pixel_char = '.';
                         let pixel_color;
                         let dist_to_button = ox * ox + oy * oy + (oz - 1.0) * (oz - 1.0);
+                        let band = oy.abs() < 0.06;
 
-                        if dist_to_button < 0.12 {
+                        if dist_to_button < 0.10 {
+                            pixel_color = black;
+                            pixel_char = '#';
+                        } else if dist_to_button < 0.18 {
                             pixel_color = white;
                             pixel_char = '@';
-                        } else if dist_to_button < 0.18 {
+                        } else if band {
                             pixel_color = black;
                             pixel_char = '#';
-                        } else if oy > -0.06 && oy < 0.06 {
-                            pixel_color = black;
-                            pixel_char = '#';
-                        } else if oy > 0.0 {
+                        } else if oy < 0.0 {
                             pixel_color = red;
                         } else {
                             pixel_color = white;
@@ -322,9 +500,16 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                         let y = (ox * sin_a + oy * cos_a) * r;
                         let z = oz * r;
 
-                        let y_final = y * cos_b - z * sin_b;
+                        let mut y_final = y * cos_b - z * sin_b;
                         let z_final = y * sin_b + z * cos_b;
                         let x_final = x;
+                        if open_amount > 0.0 && oy > 0.02 {
+                            y_final += open_amount * 0.6;
+                        }
+                        if open_amount > 0.0 && oy.abs() < 0.03 {
+                            theta += 0.03;
+                            continue;
+                        }
 
                         let camera_dist = 3.0;
                         let ooz = 1.0 / (z_final + camera_dist);
@@ -361,11 +546,13 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                     }
                     phi += 0.03;
                 }
+
             }
         }
 
         let prompt = match screen {
             Screen::Name => "trainer name + Enter",
+            Screen::Pokedex => "type 'back' + Enter",
             Screen::Game => "type 'catch' + Enter",
         };
         let prompt_line = format!("command: {} ({})", last_cmd, prompt);
@@ -378,6 +565,22 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
         for (x, ch) in prompt_line.chars().take(width).enumerate() {
             let idx = x + prompt_row * width;
             output[idx] = ch;
+        }
+
+        if let Screen::Game = screen {
+            if star_frame > 0 {
+                render_starburst(
+                    width as i32,
+                    height as i32,
+                    ball_x,
+                    ball_y,
+                    &mut output,
+                    &mut color_buf,
+                    &mut zbuffer,
+                    star_frame,
+                );
+                star_frame = star_frame.saturating_sub(1);
+            }
         }
 
         let mut frame = String::with_capacity(width * height * 6);
@@ -438,6 +641,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                     }
                 }
             }
+            Screen::Pokedex => {}
             Screen::Game => {
                 if state == GameState::Throwing {
                     a -= 0.2;
@@ -462,6 +666,116 @@ async fn close_session(write_half: &mut OwnedWriteHalf) -> io::Result<()> {
     cleanup_terminal(write_half).await?;
     write_half.write_all(b"bye\r\n").await?;
     write_half.shutdown().await
+}
+
+fn build_stream_particles(
+    pokemon: &PokemonAsset,
+    start_x: usize,
+    start_y: usize,
+    target_x: f32,
+    target_y: f32,
+) -> Vec<StreamParticle> {
+    let mut particles = Vec::new();
+    let mut idx: u16 = 0;
+    for y in 0..pokemon.image.height {
+        for x in 0..pokemon.image.width {
+            let src_idx = x + y * pokemon.image.width;
+            let ch = pokemon.image.chars[src_idx];
+            if ch == ' ' {
+                continue;
+            }
+            let color = pokemon.image.colors[src_idx];
+            particles.push(StreamParticle {
+                x0: (start_x + x) as f32,
+                y0: (start_y + y) as f32,
+                x1: target_x,
+                y1: target_y,
+                ch,
+                color,
+                start_frame: idx % 12,
+            });
+            idx = idx.wrapping_add(1);
+        }
+    }
+    particles
+}
+
+fn render_stream(
+    particles: &[StreamParticle],
+    frame: u16,
+    output: &mut [char],
+    color_buf: &mut [CellColor],
+    zbuffer: &mut [f32],
+    width: usize,
+    height: usize,
+) {
+    for particle in particles {
+        if frame < particle.start_frame {
+            continue;
+        }
+        let t = (frame - particle.start_frame) as f32 / ABSORB_FRAMES as f32;
+        let t = t.min(1.0);
+        let x = particle.x0 + (particle.x1 - particle.x0) * t;
+        let y = particle.y0 + (particle.y1 - particle.y0) * t;
+        let xi = x.round() as i32;
+        let yi = y.round() as i32;
+        if xi < 0 || yi < 0 || xi >= width as i32 || yi >= height as i32 {
+            continue;
+        }
+        let idx = (xi + yi * width as i32) as usize;
+        if 0.6 > zbuffer[idx] {
+            zbuffer[idx] = 0.6;
+            output[idx] = particle.ch;
+            let (r, g, b) = particle.color;
+            color_buf[idx] = CellColor::Rgb(r, g, b);
+        }
+    }
+}
+
+fn render_starburst(
+    width: i32,
+    height: i32,
+    ball_x: f32,
+    ball_y: f32,
+    output: &mut [char],
+    color_buf: &mut [CellColor],
+    zbuffer: &mut [f32],
+    frame: u16,
+) {
+    let center_x = (width as f32 / 2.0 + ball_x).round() as i32;
+    let center_y = (height as f32 / 2.0 + ball_y).round() as i32 - 10;
+    let t = frame as f32 / STAR_FRAMES as f32;
+    let spread = (1.0 - t) * 11.0;
+    let stars = [
+        (0.0, -1.0),
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.8, -0.6),
+        (-0.8, -0.6),
+        (0.8, 0.6),
+        (-0.8, 0.6),
+        (1.2, -0.2),
+        (-1.2, -0.2),
+        (1.2, 0.2),
+        (-1.2, 0.2),
+        (0.0, -1.6),
+        (0.0, -2.0),
+        (0.0, -2.4),
+        (0.4, -1.8),
+        (-0.4, -1.8),
+    ];
+    for (dx, dy) in stars {
+        let x = center_x + (dx * spread) as i32;
+        let y = center_y + (dy * spread) as i32;
+        if x < 0 || y < 0 || x >= width || y >= height {
+            continue;
+        }
+        let idx = (x + y * width) as usize;
+        output[idx] = '*';
+        color_buf[idx] = CellColor::Ansi("\x1b[93m");
+        zbuffer[idx] = 0.9;
+    }
 }
 
 fn color_mode_from_env() -> ColorMode {
@@ -527,6 +841,123 @@ fn pick_pokemon(pokemons: &[PokemonAsset]) -> &PokemonAsset {
     let idx = (nanos % pokemons.len() as u128) as usize;
     &pokemons[idx]
 }
+
+fn load_pokedex_view() -> io::Result<PokedexView> {
+    let names = load_gen1_names(GEN1_CSV)?;
+    Ok(PokedexView {
+        names,
+    })
+}
+
+fn load_gen1_names(path: &str) -> io::Result<Vec<String>> {
+    let data = fs::read_to_string(path)?;
+    let mut names = vec![String::new(); 151];
+    for (i, line) in data.lines().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let fields = parse_csv_line(line);
+        if fields.len() < 3 {
+            continue;
+        }
+        let id: usize = match fields[0].trim().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if id == 0 || id > 151 {
+            continue;
+        }
+        let name = fields[1].trim();
+        let form = fields[2].trim();
+        names[id - 1] = normalize_pokemon_name(name, form);
+    }
+    Ok(names)
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut in_quotes = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+            }
+            ',' if !in_quotes => {
+                out.push(buf.clone());
+                buf.clear();
+            }
+            _ => buf.push(ch),
+        }
+    }
+    out.push(buf);
+    out
+}
+
+fn normalize_pokemon_name(name: &str, form: &str) -> String {
+    let mut base = name.trim().to_lowercase();
+    base = base.replace('.', "");
+    base = base.replace('\'', "");
+    base = base.replace(' ', "-");
+    let form = form.trim();
+    if !form.is_empty() && form != " " {
+        let form = form.to_lowercase().replace(' ', "-");
+        if base == "nidoran" {
+            if form == "female" {
+                return "nidoran-f".to_string();
+            }
+            if form == "male" {
+                return "nidoran-m".to_string();
+            }
+        }
+        return format!("{}-{}", base, form);
+    }
+    base
+}
+
+fn render_pokedex(
+    view: &PokedexView,
+    caught: &HashSet<String>,
+    output: &mut [char],
+    color_buf: &mut [CellColor],
+    zbuffer: &mut [f32],
+    width: usize,
+    height: usize,
+) {
+    let grid_w = POKEDEX_COLS * POKEDEX_CELL_W;
+    let grid_h = POKEDEX_ROWS * POKEDEX_CELL_H;
+    let start_x = (width.saturating_sub(grid_w)) / 2;
+    let start_y = (height.saturating_sub(grid_h)) / 2;
+
+    for idx in 0..151 {
+        let row = idx / POKEDEX_COLS;
+        let col = idx % POKEDEX_COLS;
+        let base_x = start_x + col * POKEDEX_CELL_W;
+        let base_y = start_y + row * POKEDEX_CELL_H;
+        let number = idx + 1;
+        let digits: Vec<char> = number.to_string().chars().collect();
+        let number_w = digits.len();
+        let offset_x = base_x + (POKEDEX_CELL_W.saturating_sub(number_w)) / 2;
+        let offset_y = base_y;
+
+        let name = view.names.get(idx).map(|s| s.as_str()).unwrap_or("");
+        let caught_entry = !name.is_empty() && caught.contains(name);
+        let main = if caught_entry { "\x1b[91m" } else { "\x1b[97m" };
+
+        for (d, digit) in digits.iter().enumerate() {
+            let target_x = offset_x + d;
+            let target_y = offset_y;
+            if target_x >= width || target_y >= height {
+                continue;
+            }
+            let idx = target_x + target_y * width;
+            output[idx] = *digit;
+            color_buf[idx] = CellColor::Ansi(main);
+            zbuffer[idx] = 0.35;
+        }
+    }
+}
+
 
 fn sanitize_trainer_name(input: &str) -> Option<String> {
     let trimmed = input.trim();
