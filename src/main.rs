@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
@@ -69,8 +70,12 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    write_half
+        .write_all(b"\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l")
+        .await?;
+
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         let mut line = String::new();
         loop {
             line.clear();
@@ -90,8 +95,8 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
         }
     });
 
-    let width = 140;
-    let height = 40;
+    let width = env_usize("POKESTREAM_WIDTH").unwrap_or(140);
+    let height = env_usize("POKESTREAM_HEIGHT").unwrap_or(40);
     let aspect_ratio = 1.5;
 
     let chars = " .:-=+*#%@";
@@ -122,7 +127,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let mut welcome_accum = 0u64;
     let welcome_frame_ms: u64 = 1000 / 12;
 
-    write_half.write_all(b"\x1b[2J\x1b[H").await?;
+    write_half.write_all(b"\x1b[2J\x1b[H\x1b[?25l").await?;
 
     loop {
         let mut output: Vec<char> = vec![' '; width * height];
@@ -131,7 +136,16 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
 
         while let Ok(cmd) = cmd_rx.try_recv() {
             let cmd_trim = cmd.trim().to_lowercase();
+            if cmd.as_bytes().contains(&3) || matches!(cmd_trim.as_str(), "q" | "quit" | "exit") {
+                reader_task.abort();
+                let _ = reader_task.await;
+                let _ = close_session(&mut write_half).await;
+                return Ok(());
+            }
             if cmd_trim == "__disconnect__" {
+                reader_task.abort();
+                let _ = reader_task.await;
+                let _ = cleanup_terminal(&mut write_half).await;
                 return Ok(());
             }
             last_cmd = cmd_trim.clone();
@@ -322,6 +336,22 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
             }
         }
 
+        let prompt = match screen {
+            Screen::Welcome => "type 'start' + Enter",
+            Screen::Game => "type 'catch' + Enter",
+        };
+        let prompt_line = format!("command: {} ({})", last_cmd, prompt);
+        let prompt_row = height.saturating_sub(1);
+        for x in 0..width {
+            let idx = x + prompt_row * width;
+            output[idx] = ' ';
+            color_buf[idx] = CellColor::None;
+        }
+        for (x, ch) in prompt_line.chars().take(width).enumerate() {
+            let idx = x + prompt_row * width;
+            output[idx] = ch;
+        }
+
         let mut frame = String::with_capacity(width * height * 6);
         frame.push_str("\x1b[H");
         for i in 0..height {
@@ -363,13 +393,11 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                     }
                 }
             }
-            frame.push('\n');
+            if i + 1 < height {
+                frame.push('\n');
+            }
         }
-        let prompt = match screen {
-            Screen::Welcome => "type 'start' + Enter",
-            Screen::Game => "type 'catch' + Enter",
-        };
-        let _ = write!(frame, "command: {} ({})\n", last_cmd, prompt);
+        let _ = write!(frame, "\x1b[{};1H\x1b[J", height + 1);
         write_half.write_all(frame.as_bytes()).await?;
 
         match screen {
@@ -394,6 +422,18 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
 
         time::sleep(Duration::from_millis(30)).await;
     }
+}
+
+async fn cleanup_terminal(write_half: &mut OwnedWriteHalf) -> io::Result<()> {
+    write_half
+        .write_all(b"\x1b[0m\x1b[?25h\x1b[?7h\x1b[?1049l")
+        .await
+}
+
+async fn close_session(write_half: &mut OwnedWriteHalf) -> io::Result<()> {
+    cleanup_terminal(write_half).await?;
+    write_half.write_all(b"bye\r\n").await?;
+    write_half.shutdown().await
 }
 
 fn color_mode_from_env() -> ColorMode {
@@ -426,6 +466,11 @@ fn color_mode_from_env() -> ColorMode {
     }
     ColorMode::Ansi256
 }
+
+fn env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok().and_then(|val| val.parse::<usize>().ok())
+}
+
 
 fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     // 16-231: 6x6x6 color cube, 232-255: grayscale

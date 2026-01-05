@@ -35,6 +35,15 @@ Recommended terminal size is at least 140x40.
 ## Controls
 - Welcome screen: type `start`, `play`, or `catch`
 - In game: type `catch` to throw the Pokeball
+- Exit the game: type `q`, `quit`, or `exit`
+
+## Exiting Telnet
+After the game closes, exit your Telnet client:
+
+```text
+Press Ctrl + ]
+Type quit
+```
 
 ## Architecture Summary
 - **Server loop**: `src/main.rs` binds on `0.0.0.0:8080` and spawns a Tokio task per connection.
