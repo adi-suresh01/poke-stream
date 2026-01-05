@@ -1,16 +1,19 @@
 mod ascii;
 mod pokemon;
 
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::env;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::{Connection, OptionalExtension};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
+use tokio::task;
 
 #[derive(PartialEq)]
 enum GameState {
@@ -27,12 +30,12 @@ enum CellColor {
 }
 
 struct Assets {
-    pokemons: Vec<ascii::AsciiImage>,
+    pokemons: Vec<PokemonAsset>,
     arcanine_frames: Vec<ascii::AsciiImage>,
 }
 
 enum Screen {
-    Welcome,
+    Name,
     Game,
 }
 
@@ -43,15 +46,29 @@ enum ColorMode {
     Mono,
 }
 
+struct PokemonAsset {
+    name: &'static str,
+    image: ascii::AsciiImage,
+}
+
 const IMG_CHARSET: &str =
     ".'`^\",:;Il!i><~+_-?][}{1)(|\\/*tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$Ñ";
 
+const DB_PATH: &str = "pokedex.db";
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    init_db().await?;
     let assets = Arc::new(Assets {
         pokemons: vec![
-            pokemon::load_growlithe(IMG_CHARSET),
-            pokemon::load_pikachu(IMG_CHARSET),
+            PokemonAsset {
+                name: "growlithe",
+                image: pokemon::load_growlithe(IMG_CHARSET),
+            },
+            PokemonAsset {
+                name: "pikachu",
+                image: pokemon::load_pikachu(IMG_CHARSET),
+            },
         ],
         arcanine_frames: pokemon::load_arcanine_frames(IMG_CHARSET),
     });
@@ -101,6 +118,8 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
 
     let chars = " .:-=+*#%@";
     let pokemon = pick_pokemon(&assets.pokemons);
+    let mut trainer_name: Option<String> = None;
+    let mut pokedex: HashSet<String> = HashSet::new();
     let arcanine_frames = &assets.arcanine_frames;
 
     let reset = "\x1b[0m";
@@ -112,6 +131,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let mut state = GameState::Idle;
     let mut frame_count = 0;
     let mut caught_timer = 0;
+    let mut capture_recorded = false;
 
     let floor_y: f32 = 5.0;
 
@@ -122,7 +142,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let mut tilt_phase: f32 = 0.0;
 
     let mut last_cmd = String::new();
-    let mut screen = Screen::Welcome;
+    let mut screen = Screen::Name;
     let mut welcome_frame = 0usize;
     let mut welcome_accum = 0u64;
     let welcome_frame_ms: u64 = 1000 / 12;
@@ -150,19 +170,18 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
             }
             last_cmd = cmd_trim.clone();
             match screen {
-                Screen::Welcome => {
-                    if cmd_trim == "start" || cmd_trim == "play" || cmd_trim == "catch" {
+                Screen::Name => {
+                    if let Some(name) = sanitize_trainer_name(&cmd_trim) {
+                        pokedex = load_pokedex(&name).await.unwrap_or_default();
+                        trainer_name = Some(name);
                         screen = Screen::Game;
-                        if cmd_trim == "catch" && state == GameState::Idle {
-                            state = GameState::Throwing;
-                            frame_count = 0;
-                        }
                     }
                 }
                 Screen::Game => {
                     if cmd_trim == "catch" && state == GameState::Idle {
                         state = GameState::Throwing;
                         frame_count = 0;
+                        capture_recorded = false;
                     }
                 }
             }
@@ -185,11 +204,20 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                         ball_x = 15.0;
                         ball_y = floor_y;
                         caught_timer = 0;
+                        capture_recorded = false;
                     }
                 }
                 GameState::Caught => {
                     caught_timer += 1;
                     ball_x = 15.0;
+                    if !capture_recorded {
+                        if let Some(name) = trainer_name.as_ref() {
+                            if pokedex.insert(pokemon.name.to_string()) {
+                                let _ = save_pokedex(name, &pokedex).await;
+                            }
+                        }
+                        capture_recorded = true;
+                    }
 
                     if caught_timer > 50 {
                         state = GameState::Idle;
@@ -202,7 +230,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
         }
 
         match screen {
-            Screen::Welcome => {
+            Screen::Name => {
                 if !arcanine_frames.is_empty() {
                     let frame = &arcanine_frames[welcome_frame % arcanine_frames.len()];
                     let start_x = (width.saturating_sub(frame.width)) / 2;
@@ -232,17 +260,17 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                     let grow_start_y = 5;
                     let grow_start_x = (width / 2) + 2;
 
-                    for y in 0..pokemon.height {
-                        for x in 0..pokemon.width {
+                    for y in 0..pokemon.image.height {
+                        for x in 0..pokemon.image.width {
                             let target_y = grow_start_y + y;
                             let target_x = grow_start_x + x;
                             if target_y < height && target_x < width {
-                                let src_idx = x + y * pokemon.width;
-                                let ch = pokemon.chars[src_idx];
+                                let src_idx = x + y * pokemon.image.width;
+                                let ch = pokemon.image.chars[src_idx];
                                 if ch != ' ' {
                                     let idx = target_x + target_y * width;
                                     output[idx] = ch;
-                                    let (r, g, b) = pokemon.colors[src_idx];
+                                    let (r, g, b) = pokemon.image.colors[src_idx];
                                     color_buf[idx] = CellColor::Rgb(r, g, b);
                                     zbuffer[idx] = 0.4;
                                 }
@@ -337,7 +365,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
         }
 
         let prompt = match screen {
-            Screen::Welcome => "type 'start' + Enter",
+            Screen::Name => "trainer name + Enter",
             Screen::Game => "type 'catch' + Enter",
         };
         let prompt_line = format!("command: {} ({})", last_cmd, prompt);
@@ -401,7 +429,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
         write_half.write_all(frame.as_bytes()).await?;
 
         match screen {
-            Screen::Welcome => {
+            Screen::Name => {
                 welcome_accum += 30;
                 if welcome_accum >= welcome_frame_ms {
                     welcome_accum = 0;
@@ -488,7 +516,7 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     16 + 36 * rc + 6 * gc + bc
 }
 
-fn pick_pokemon(pokemons: &[ascii::AsciiImage]) -> &ascii::AsciiImage {
+fn pick_pokemon(pokemons: &[PokemonAsset]) -> &PokemonAsset {
     if pokemons.is_empty() {
         panic!("no pokemon assets loaded");
     }
@@ -498,4 +526,85 @@ fn pick_pokemon(pokemons: &[ascii::AsciiImage]) -> &ascii::AsciiImage {
         .as_nanos();
     let idx = (nanos % pokemons.len() as u128) as usize;
     &pokemons[idx]
+}
+
+fn sanitize_trainer_name(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() > 16 {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some(trimmed.to_lowercase())
+}
+
+async fn init_db() -> io::Result<()> {
+    task::spawn_blocking(|| -> io::Result<()> {
+        let conn = Connection::open(DB_PATH)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS trainers (
+                name TEXT PRIMARY KEY,
+                pokedex TEXT NOT NULL
+            )",
+            [],
+        )
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
+}
+
+async fn load_pokedex(name: &str) -> io::Result<HashSet<String>> {
+    let name = name.to_string();
+    task::spawn_blocking(move || -> io::Result<HashSet<String>> {
+        let conn = Connection::open(DB_PATH)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let json: Option<String> = conn
+            .query_row("SELECT pokedex FROM trainers WHERE name = ?1", [&name], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let list: Vec<String> = match json {
+            Some(text) => serde_json::from_str(&text)
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?,
+            None => Vec::new(),
+        };
+        Ok(list.into_iter().collect())
+    })
+    .await
+    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
+}
+
+async fn save_pokedex(name: &str, pokedex: &HashSet<String>) -> io::Result<()> {
+    let name = name.to_string();
+    let mut list: Vec<String> = pokedex.iter().cloned().collect();
+    list.sort();
+    let payload = serde_json::to_string(&list)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    task::spawn_blocking(move || -> io::Result<()> {
+        let conn = Connection::open(DB_PATH)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        conn.execute(
+            "INSERT INTO trainers (name, pokedex)
+             VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET pokedex = excluded.pokedex",
+            (&name, &payload),
+        )
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
 }

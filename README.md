@@ -33,7 +33,7 @@ telnet localhost 8080
 Recommended terminal size is at least 140x40.
 
 ## Controls
-- Welcome screen: type `start`, `play`, or `catch`
+- On connect: enter a unique trainer name
 - In game: type `catch` to throw the Pokeball
 - Exit the game: type `q`, `quit`, or `exit`
 
