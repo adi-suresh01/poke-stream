@@ -837,7 +837,9 @@ async fn main() -> io::Result<()> {
         pokedex,
     });
 
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    let selection_mode = selection_mode_from_env();
+    let port = server_port_from_env(selection_mode);
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     loop {
         let (stream, _) = listener.accept().await?;
         let assets = Arc::clone(&assets);
@@ -1132,6 +1134,18 @@ fn selection_mode_from_env() -> SelectionMode {
         }
     }
     SelectionMode::DailyWeighted
+}
+
+fn server_port_from_env(selection_mode: SelectionMode) -> u16 {
+    if let Ok(raw) = env::var("POKESTREAM_PORT") {
+        if let Ok(port) = raw.parse::<u16>() {
+            return port;
+        }
+    }
+    match selection_mode {
+        SelectionMode::RandomPerSession => 8081,
+        SelectionMode::DailyWeighted => 8080,
+    }
 }
 
 fn frame_interval_from_env() -> Duration {
