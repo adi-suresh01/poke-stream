@@ -13,7 +13,7 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, MissedTickBehavior};
 use tokio::task;
 
 #[derive(PartialEq)]
@@ -111,6 +111,11 @@ enum CommandAction {
     None,
     Exit,
     Disconnect,
+}
+
+enum OutputMessage {
+    Bytes(Vec<u8>),
+    Close { send_bye: bool },
 }
 
 struct SessionState {
@@ -656,10 +661,10 @@ impl SessionState {
         }
 
         let prompt = match self.screen {
-            Screen::Name => "trainer name + Enter",
-            Screen::Pokedex => "number + Enter or 'back' + Enter",
-            Screen::PokedexDetail => "type 'back' + Enter",
-            Screen::Game => "type 'catch' + Enter or 'pokedex' + Enter",
+            Screen::Name => "enter a unique trainer name to begin catching (q to quit)",
+            Screen::Pokedex => "type a caught number (1-151), or 'back' to return (q to quit)",
+            Screen::PokedexDetail => "type 'back' to return to the pokedex (q to quit)",
+            Screen::Game => "type 'catch' to throw, or 'pokedex' to view your dex (q to quit)",
         };
         let prompt_line = format!("command: {} ({})", self.last_cmd, prompt);
         let prompt_row = self.height.saturating_sub(1);
@@ -677,47 +682,74 @@ impl SessionState {
     }
 
     fn compose_frame(&self, buffers: &RenderBuffers) -> String {
+        #[derive(Copy, Clone, PartialEq)]
+        enum ActiveColor {
+            None,
+            Ansi(&'static str),
+            Rgb(u8, u8, u8),
+            Ansi256(u8),
+        }
+
         let reset = "\x1b[0m";
-        let mut frame = String::with_capacity(self.width * self.height * 6);
+        let mut frame = String::with_capacity(self.width * self.height * 4);
         frame.push_str("\x1b[H");
+        let mut active = ActiveColor::None;
+
         for i in 0..self.height {
             for j in 0..self.width {
                 let idx = j + i * self.width;
-                if buffers.output[idx] == ' ' {
+                let ch = buffers.output[idx];
+                if ch == ' ' {
                     frame.push(' ');
-                } else {
-                    match buffers.color_buf[idx] {
-                        CellColor::None => frame.push(buffers.output[idx]),
-                        CellColor::Ansi(code) => {
-                            frame.push_str(code);
-                            frame.push(buffers.output[idx]);
-                            frame.push_str(reset);
-                        }
-                        CellColor::Rgb(r, g, b) => {
-                            match self.color_mode {
-                                ColorMode::Truecolor => {
-                                    let _ = write!(
-                                        frame,
-                                        "\x1b[38;2;{};{};{}m{}",
-                                        r,
-                                        g,
-                                        b,
-                                        buffers.output[idx]
-                                    );
-                                    frame.push_str(reset);
-                                }
-                                ColorMode::Ansi256 => {
-                                    let code = rgb_to_ansi256(r, g, b);
-                                    let _ = write!(frame, "\x1b[38;5;{}m{}", code, buffers.output[idx]);
-                                    frame.push_str(reset);
-                                }
-                                ColorMode::Mono => {
-                                    frame.push(buffers.output[idx]);
-                                }
-                            }
-                        }
-                    }
+                    continue;
                 }
+
+                match buffers.color_buf[idx] {
+                    CellColor::None => {
+                        if active != ActiveColor::None {
+                            frame.push_str(reset);
+                            active = ActiveColor::None;
+                        }
+                        frame.push(ch);
+                    }
+                    CellColor::Ansi(code) => {
+                        if active != ActiveColor::Ansi(code) {
+                            frame.push_str(code);
+                            active = ActiveColor::Ansi(code);
+                        }
+                        frame.push(ch);
+                    }
+                    CellColor::Rgb(r, g, b) => match self.color_mode {
+                        ColorMode::Truecolor => {
+                            let desired = ActiveColor::Rgb(r, g, b);
+                            if active != desired {
+                                let _ = write!(frame, "\x1b[38;2;{};{};{}m", r, g, b);
+                                active = desired;
+                            }
+                            frame.push(ch);
+                        }
+                        ColorMode::Ansi256 => {
+                            let code = rgb_to_ansi256(r, g, b);
+                            let desired = ActiveColor::Ansi256(code);
+                            if active != desired {
+                                let _ = write!(frame, "\x1b[38;5;{}m", code);
+                                active = desired;
+                            }
+                            frame.push(ch);
+                        }
+                        ColorMode::Mono => {
+                            if active != ActiveColor::None {
+                                frame.push_str(reset);
+                                active = ActiveColor::None;
+                            }
+                            frame.push(ch);
+                        }
+                    },
+                }
+            }
+            if active != ActiveColor::None {
+                frame.push_str(reset);
+                active = ActiveColor::None;
             }
             if i + 1 < self.height {
                 frame.push('\n');
@@ -760,10 +792,6 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half
-        .write_all(b"\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l")
-        .await?;
-
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
     let reader_task = tokio::spawn(async move {
         let mut line = String::new();
@@ -791,34 +819,86 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let mut session = SessionState::new(width, height, color_mode, &assets);
     let mut buffers = RenderBuffers::new(width, height);
 
-    write_half.write_all(b"\x1b[2J\x1b[H\x1b[?25l").await?;
-
-    loop {
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match session.handle_command(&cmd, &assets).await {
-                CommandAction::Exit => {
-                    reader_task.abort();
-                    let _ = reader_task.await;
-                    let _ = close_session(&mut write_half).await;
-                    return Ok(());
+    let (out_tx, out_rx) = mpsc::channel::<OutputMessage>(2);
+    let writer_task = tokio::spawn(async move {
+        let mut write_half = write_half;
+        let mut out_rx = out_rx;
+        while let Some(msg) = out_rx.recv().await {
+            match msg {
+                OutputMessage::Bytes(bytes) => {
+                    if write_half.write_all(&bytes).await.is_err() {
+                        break;
+                    }
                 }
-                CommandAction::Disconnect => {
-                    reader_task.abort();
-                    let _ = reader_task.await;
-                    let _ = cleanup_terminal(&mut write_half).await;
-                    return Ok(());
+                OutputMessage::Close { send_bye } => {
+                    if send_bye {
+                        let _ = close_session(&mut write_half).await;
+                    } else {
+                        let _ = cleanup_terminal(&mut write_half).await;
+                        let _ = write_half.shutdown().await;
+                    }
+                    break;
                 }
-                CommandAction::None => {}
             }
         }
+    });
 
-        session.update(&assets).await;
-        session.render(&assets, &mut buffers);
-        let frame = session.compose_frame(&buffers);
-        write_half.write_all(frame.as_bytes()).await?;
+    let _ = out_tx
+        .send(OutputMessage::Bytes(
+            b"\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l".to_vec(),
+        ))
+        .await;
+    let _ = out_tx
+        .send(OutputMessage::Bytes(b"\x1b[2J\x1b[H\x1b[?25l".to_vec()))
+        .await;
 
-        time::sleep(Duration::from_millis(30)).await;
+    let frame_interval = frame_interval_from_env();
+    let mut ticker = time::interval(frame_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            maybe_cmd = cmd_rx.recv() => {
+                let cmd = match maybe_cmd {
+                    Some(cmd) => cmd,
+                    None => String::from("__disconnect__"),
+                };
+                match session.handle_command(&cmd, &assets).await {
+                    CommandAction::Exit => {
+                        reader_task.abort();
+                        let _ = reader_task.await;
+                        let _ = out_tx.send(OutputMessage::Close { send_bye: true }).await;
+                        break;
+                    }
+                    CommandAction::Disconnect => {
+                        reader_task.abort();
+                        let _ = reader_task.await;
+                        let _ = out_tx.send(OutputMessage::Close { send_bye: false }).await;
+                        break;
+                    }
+                    CommandAction::None => {}
+                }
+
+                if out_tx.capacity() > 0 {
+                    session.render(&assets, &mut buffers);
+                    let frame = session.compose_frame(&buffers);
+                    let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+                }
+            }
+            _ = ticker.tick() => {
+                if out_tx.capacity() == 0 {
+                    continue;
+                }
+                session.update(&assets).await;
+                session.render(&assets, &mut buffers);
+                let frame = session.compose_frame(&buffers);
+                let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+            }
+        }
     }
+
+    let _ = writer_task.await;
+    Ok(())
 }
 
 async fn cleanup_terminal(write_half: &mut OwnedWriteHalf) -> io::Result<()> {
@@ -976,6 +1056,25 @@ fn color_mode_from_env() -> ColorMode {
 
 fn env_usize(key: &str) -> Option<usize> {
     env::var(key).ok().and_then(|val| val.parse::<usize>().ok())
+}
+
+fn frame_interval_from_env() -> Duration {
+    if let Ok(raw) = env::var("POKESTREAM_FPS") {
+        if let Ok(fps) = raw.parse::<u64>() {
+            if fps > 0 {
+                let ms = (1000 / fps).max(10);
+                return Duration::from_millis(ms);
+            }
+        }
+    }
+    if let Ok(raw) = env::var("POKESTREAM_FRAME_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            if ms > 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+    }
+    Duration::from_millis(30)
 }
 
 
