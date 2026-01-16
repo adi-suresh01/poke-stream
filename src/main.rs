@@ -1,7 +1,7 @@
 mod ascii;
 mod pokemon;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::env;
 use std::sync::Arc;
@@ -48,6 +48,12 @@ enum Screen {
 }
 
 #[derive(Copy, Clone, PartialEq)]
+enum SelectionMode {
+    DailyWeighted,
+    RandomPerSession,
+}
+
+#[derive(Copy, Clone, PartialEq)]
 enum ColorMode {
     Truecolor,
     Ansi256,
@@ -84,6 +90,7 @@ struct PokemonAsset {
 
 struct PokedexView {
     names: Vec<String>,
+    totals_by_name: HashMap<String, u16>,
 }
 
 struct StreamParticle {
@@ -124,6 +131,7 @@ struct SessionState {
     aspect_ratio: f32,
     chars: &'static str,
     pokemon_index: usize,
+    selection_mode: SelectionMode,
     trainer_name: Option<String>,
     pokedex: HashSet<String>,
     screen: Screen,
@@ -154,16 +162,28 @@ struct SessionState {
     welcome_frame_ms: u64,
     last_cmd: String,
     color_mode: ColorMode,
+    daily_key: i64,
 }
 
 impl SessionState {
-    fn new(width: usize, height: usize, color_mode: ColorMode, assets: &Assets) -> Self {
+    fn new(
+        width: usize,
+        height: usize,
+        color_mode: ColorMode,
+        selection_mode: SelectionMode,
+        assets: &Assets,
+    ) -> Self {
+        let pokemon_index = match selection_mode {
+            SelectionMode::RandomPerSession => pick_pokemon_index(&assets.pokemons),
+            SelectionMode::DailyWeighted => 0,
+        };
         Self {
             width,
             height,
             aspect_ratio: 1.5,
             chars: " .:-=+*#%@",
-            pokemon_index: pick_pokemon_index(&assets.pokemons),
+            pokemon_index,
+            selection_mode,
             trainer_name: None,
             pokedex: HashSet::new(),
             screen: Screen::Name,
@@ -194,6 +214,7 @@ impl SessionState {
             welcome_frame_ms: 1000 / 12,
             last_cmd: String::new(),
             color_mode,
+            daily_key: -1,
         }
     }
 
@@ -215,6 +236,12 @@ impl SessionState {
                 if let Some(name) = sanitize_trainer_name(&cmd_trim) {
                     self.pokedex = load_pokedex(&name).await.unwrap_or_default();
                     self.trainer_name = Some(name);
+                    match self.selection_mode {
+                        SelectionMode::DailyWeighted => self.refresh_daily_pokemon(assets),
+                        SelectionMode::RandomPerSession => {
+                            self.pokemon_index = pick_pokemon_index(&assets.pokemons);
+                        }
+                    }
                     self.screen = Screen::Game;
                 }
             }
@@ -263,6 +290,13 @@ impl SessionState {
     }
 
     async fn update(&mut self, assets: &Assets) {
+        if self.selection_mode == SelectionMode::DailyWeighted
+            && self.trainer_name.is_some()
+            && self.state == GameState::Idle
+        {
+            self.refresh_daily_pokemon(assets);
+        }
+
         if let Screen::Game = self.screen {
             match self.state {
                 GameState::Idle => {
@@ -758,6 +792,31 @@ impl SessionState {
         let _ = write!(frame, "\x1b[{};1H\x1b[J", self.height + 1);
         frame
     }
+
+    fn refresh_daily_pokemon(&mut self, assets: &Assets) {
+        if self.selection_mode != SelectionMode::DailyWeighted {
+            return;
+        }
+        let Some(name) = self.trainer_name.as_ref() else {
+            return;
+        };
+        let day = current_day_index_est();
+        if day == self.daily_key {
+            return;
+        }
+        self.daily_key = day;
+        let legendary_unlocked = legendaries_unlocked(&self.pokedex, &assets.pokedex.names);
+        let seed = daily_seed(name, day);
+        self.pokemon_index = pick_weighted_pokemon(
+            &assets.pokemons,
+            &assets.pokedex,
+            seed,
+            legendary_unlocked,
+        );
+        self.stream_particles.clear();
+        self.caught_message = None;
+        self.caught_message_timer = 0;
+    }
 }
 const GEN1_CSV: &str = "sample_images/gen01.csv";
 const POKEDEX_COLS: usize = 15;
@@ -816,7 +875,8 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let width = env_usize("POKESTREAM_WIDTH").unwrap_or(140);
     let height = env_usize("POKESTREAM_HEIGHT").unwrap_or(40);
     let color_mode = color_mode_from_env();
-    let mut session = SessionState::new(width, height, color_mode, &assets);
+    let selection_mode = selection_mode_from_env();
+    let mut session = SessionState::new(width, height, color_mode, selection_mode, &assets);
     let mut buffers = RenderBuffers::new(width, height);
 
     let (out_tx, out_rx) = mpsc::channel::<OutputMessage>(2);
@@ -1058,6 +1118,22 @@ fn env_usize(key: &str) -> Option<usize> {
     env::var(key).ok().and_then(|val| val.parse::<usize>().ok())
 }
 
+fn selection_mode_from_env() -> SelectionMode {
+    if let Ok(mode) = env::var("POKESTREAM_MODE") {
+        let mode = mode.to_lowercase();
+        if matches!(mode.as_str(), "random" | "dev_random" | "random_per_session") {
+            return SelectionMode::RandomPerSession;
+        }
+    }
+    if let Ok(raw) = env::var("POKESTREAM_RANDOM") {
+        let raw = raw.to_lowercase();
+        if matches!(raw.as_str(), "1" | "true" | "yes") {
+            return SelectionMode::RandomPerSession;
+        }
+    }
+    SelectionMode::DailyWeighted
+}
+
 fn frame_interval_from_env() -> Duration {
     if let Ok(raw) = env::var("POKESTREAM_FPS") {
         if let Ok(fps) = raw.parse::<u64>() {
@@ -1075,6 +1151,119 @@ fn frame_interval_from_env() -> Duration {
         }
     }
     Duration::from_millis(30)
+}
+
+fn current_day_index_est() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let shifted = secs - 5 * 3600;
+    shifted.div_euclid(86_400)
+}
+
+fn daily_seed(trainer: &str, day_index: i64) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in trainer.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for b in day_index.to_le_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn next_u64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+fn is_legendary(name: &str) -> bool {
+    matches!(name, "articuno" | "zapdos" | "moltres" | "mewtwo" | "mew")
+}
+
+fn is_starter(name: &str) -> bool {
+    matches!(
+        name,
+        "bulbasaur" | "charmander" | "squirtle" | "pikachu" | "eevee"
+    )
+}
+
+fn legendaries_unlocked(pokedex: &HashSet<String>, names: &[String]) -> bool {
+    for name in names {
+        if name.is_empty() || is_legendary(name) {
+            continue;
+        }
+        if !pokedex.contains(name) {
+            return false;
+        }
+    }
+    true
+}
+
+fn pokemon_weight(name: &str, total: Option<u16>, legendary_unlocked: bool) -> u32 {
+    if is_legendary(name) && !legendary_unlocked {
+        return 0;
+    }
+    let total = total.unwrap_or(350) as i32;
+    let mut weight = (600 - total).clamp(20, 500) as f32;
+
+    if total >= 500 {
+        weight *= 0.35;
+    } else if total >= 450 {
+        weight *= 0.55;
+    } else if total >= 400 {
+        weight *= 0.75;
+    } else if total <= 300 {
+        weight *= 1.25;
+    }
+
+    if is_starter(name) {
+        weight *= 0.8;
+    }
+
+    if is_legendary(name) {
+        weight *= 0.05;
+    }
+
+    weight.max(1.0) as u32
+}
+
+fn pick_weighted_pokemon(
+    pokemons: &[PokemonAsset],
+    pokedex_view: &PokedexView,
+    seed: u64,
+    legendary_unlocked: bool,
+) -> usize {
+    let mut weights = Vec::with_capacity(pokemons.len());
+    for (idx, pokemon) in pokemons.iter().enumerate() {
+        let total = pokedex_view.totals_by_name.get(&pokemon.name).copied();
+        let weight = pokemon_weight(&pokemon.name, total, legendary_unlocked);
+        if weight > 0 {
+            weights.push((idx, weight));
+        }
+    }
+    if weights.is_empty() {
+        return 0;
+    }
+
+    let total_weight: u64 = weights.iter().map(|(_, w)| *w as u64).sum();
+    let mut rng = seed;
+    let roll = next_u64(&mut rng) % total_weight;
+    let mut acc = 0u64;
+    for (idx, weight) in weights {
+        acc += weight as u64;
+        if roll < acc {
+            return idx;
+        }
+    }
+    0
 }
 
 
@@ -1106,9 +1295,10 @@ fn pick_pokemon_index(pokemons: &[PokemonAsset]) -> usize {
 }
 
 fn load_pokedex_view() -> io::Result<PokedexView> {
-    let names = load_gen1_names(GEN1_CSV)?;
+    let (names, totals_by_name) = load_gen1_data(GEN1_CSV)?;
     Ok(PokedexView {
         names,
+        totals_by_name,
     })
 }
 
@@ -1127,15 +1317,16 @@ fn load_pokemon_assets(names: &[String], charset: &str) -> Vec<PokemonAsset> {
     assets
 }
 
-fn load_gen1_names(path: &str) -> io::Result<Vec<String>> {
+fn load_gen1_data(path: &str) -> io::Result<(Vec<String>, HashMap<String, u16>)> {
     let data = fs::read_to_string(path)?;
     let mut names = vec![String::new(); 151];
+    let mut totals_by_name = HashMap::new();
     for (i, line) in data.lines().enumerate() {
         if i == 0 {
             continue;
         }
         let fields = parse_csv_line(line);
-        if fields.len() < 3 {
+        if fields.len() < 6 {
             continue;
         }
         let id: usize = match fields[0].trim().parse() {
@@ -1147,9 +1338,14 @@ fn load_gen1_names(path: &str) -> io::Result<Vec<String>> {
         }
         let name = fields[1].trim();
         let form = fields[2].trim();
-        names[id - 1] = normalize_pokemon_name(name, form);
+        let total: u16 = fields[5].trim().parse().unwrap_or(0);
+        let normalized = normalize_pokemon_name(name, form);
+        names[id - 1] = normalized.clone();
+        if total > 0 {
+            totals_by_name.insert(normalized, total);
+        }
     }
-    Ok(names)
+    Ok((names, totals_by_name))
 }
 
 fn parse_csv_line(line: &str) -> Vec<String> {
