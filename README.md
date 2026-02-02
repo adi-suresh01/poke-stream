@@ -1,4 +1,5 @@
 # Poke-Stream
+Visit [https://pokestream.me](url) for product details
 
 ![Arcanine animation](arcanine.gif)
 
