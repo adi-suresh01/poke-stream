@@ -1,4 +1,4 @@
-use crate::ascii::{load_ascii_animation, load_ascii_image, AsciiImage};
+use crate::ascii::{AsciiImage, load_ascii_animation, load_ascii_image};
 use std::path::Path;
 
 const ARCANINE_PATH: &str = "assets/pokemon/arcanine.gif";

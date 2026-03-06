@@ -17,12 +17,17 @@ pub fn load_ascii_image(path: &str, width: usize, height: usize, charset: &str) 
     ascii_from_rgb(img, charset)
 }
 
-pub fn load_ascii_animation(path: &str, width: usize, height: usize, charset: &str) -> Vec<AsciiImage> {
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|_| panic!("failed to load animation: {path}"));
+pub fn load_ascii_animation(
+    path: &str,
+    width: usize,
+    height: usize,
+    charset: &str,
+) -> Vec<AsciiImage> {
+    let file =
+        std::fs::File::open(path).unwrap_or_else(|_| panic!("failed to load animation: {path}"));
     let reader = std::io::BufReader::new(file);
-    let decoder = GifDecoder::new(reader)
-        .unwrap_or_else(|_| panic!("failed to decode animation: {path}"));
+    let decoder =
+        GifDecoder::new(reader).unwrap_or_else(|_| panic!("failed to decode animation: {path}"));
     let frames = decoder
         .into_frames()
         .collect_frames()
@@ -120,9 +125,17 @@ fn ascii_from_rgb(img: RgbImage, charset: &str) -> AsciiImage {
             let lum = base_lum[idx];
 
             let left = if x > 0 { base_lum[idx - 1] } else { lum };
-            let right = if x + 1 < width { base_lum[idx + 1] } else { lum };
+            let right = if x + 1 < width {
+                base_lum[idx + 1]
+            } else {
+                lum
+            };
             let up = if y > 0 { base_lum[idx - width] } else { lum };
-            let down = if y + 1 < height { base_lum[idx + width] } else { lum };
+            let down = if y + 1 < height {
+                base_lum[idx + width]
+            } else {
+                lum
+            };
             let edge = ((right - left).abs() + (down - up).abs()) * 0.7;
 
             let lx = -0.6;
