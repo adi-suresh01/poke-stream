@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -136,6 +136,12 @@ enum CommandAction {
     Disconnect,
 }
 
+enum InputEvent {
+    Command(String),
+    Typing(String),
+    Disconnect,
+}
+
 enum OutputMessage {
     Bytes(Vec<u8>),
     Close { send_bye: bool },
@@ -179,6 +185,7 @@ struct SessionState {
     welcome_accum: u64,
     welcome_frame_ms: u64,
     last_cmd: String,
+    current_input: String,
     color_mode: ColorMode,
     daily_key: i64,
 }
@@ -233,6 +240,7 @@ impl SessionState {
             welcome_accum: 0,
             welcome_frame_ms: 1000 / 12,
             last_cmd: String::new(),
+            current_input: String::new(),
             color_mode,
             daily_key: -1,
         }
@@ -854,15 +862,17 @@ impl SessionState {
             }
         }
 
-        let prompt = match self.screen {
-            Screen::Name => "enter a unique trainer name to begin catching (q to quit)",
-            Screen::Pokedex => "type a caught number (1-151), or 'back' to return (q to quit)",
-            Screen::PokedexDetail => "type 'back' to return to the pokedex (q to quit)",
-            Screen::Game => {
-                "type 'catch'/'pokedex' or ask a question like 'what is this pokemon?' (q to quit)"
-            }
+        let hint = match self.screen {
+            Screen::Name => "trainer name",
+            Screen::Pokedex => "number/back",
+            Screen::PokedexDetail => "back",
+            Screen::Game => "catch/pokedex/q",
         };
-        let prompt_line = format!("command: {} ({})", self.last_cmd, prompt);
+        let prompt_line = if self.current_input.is_empty() {
+            format!("> ({hint})")
+        } else {
+            format!("> {}", self.current_input)
+        };
         let prompt_row = self.height.saturating_sub(1);
         for x in 0..self.width {
             let idx = x + prompt_row * self.width;
@@ -872,6 +882,12 @@ impl SessionState {
         for (x, ch) in prompt_line.chars().take(self.width).enumerate() {
             let idx = x + prompt_row * self.width;
             output[idx] = ch;
+            if self.current_input.is_empty() {
+                color_buf[idx] = CellColor::Ansi("\x1b[90m");
+            } else {
+                color_buf[idx] = CellColor::Ansi("\x1b[97m");
+            }
+            zbuffer[idx] = 1.0;
         }
 
         let _ = reset;
@@ -1010,23 +1026,72 @@ async fn main() -> io::Result<()> {
 
 async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = read_half;
 
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
     let reader_task = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
         let mut line = String::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
+            match reader.read(&mut buf).await {
                 Ok(0) => {
-                    let _ = cmd_tx.send(String::from("__disconnect__"));
+                    let _ = input_tx.send(InputEvent::Disconnect);
                     break;
                 }
                 Ok(_) => {
-                    let _ = cmd_tx.send(line.clone());
+                    let b = buf[0];
+                    // Skip telnet IAC sequences
+                    if b == 255 {
+                        // Read command byte
+                        if reader.read(&mut buf).await.unwrap_or(0) == 0 {
+                            let _ = input_tx.send(InputEvent::Disconnect);
+                            break;
+                        }
+                        let cmd = buf[0];
+                        // WILL/WONT/DO/DONT have one option byte
+                        if matches!(cmd, 251..=254) {
+                            let _ = reader.read(&mut buf).await;
+                        }
+                        continue;
+                    }
+                    // Enter (CR or LF)
+                    if b == 13 || b == 10 {
+                        // Skip LF after CR
+                        if b == 13 {
+                            // Peek for \n but don't block — telnet sends \r\n
+                            let _ = reader.read(&mut buf).await;
+                        }
+                        let cmd = line.clone();
+                        line.clear();
+                        let _ = input_tx.send(InputEvent::Command(cmd));
+                        let _ = input_tx.send(InputEvent::Typing(String::new()));
+                        continue;
+                    }
+                    // Backspace or DEL
+                    if b == 8 || b == 127 {
+                        line.pop();
+                        let _ = input_tx.send(InputEvent::Typing(line.clone()));
+                        continue;
+                    }
+                    // Ctrl+C
+                    if b == 3 {
+                        line.clear();
+                        let _ = input_tx.send(InputEvent::Command("\x03".to_string()));
+                        let _ = input_tx.send(InputEvent::Typing(String::new()));
+                        continue;
+                    }
+                    // Ignore other control chars
+                    if b < 32 {
+                        continue;
+                    }
+                    // Regular printable character
+                    if line.len() < 120 {
+                        line.push(b as char);
+                        let _ = input_tx.send(InputEvent::Typing(line.clone()));
+                    }
                 }
                 Err(_) => {
-                    let _ = cmd_tx.send(String::from("__disconnect__"));
+                    let _ = input_tx.send(InputEvent::Disconnect);
                     break;
                 }
             }
@@ -1064,6 +1129,12 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
         }
     });
 
+    // Telnet: WILL ECHO (server handles echo) + WILL SUPPRESS-GO-AHEAD (character mode)
+    let telnet_neg: Vec<u8> = vec![
+        255, 251, 1, // IAC WILL ECHO
+        255, 251, 3, // IAC WILL SGA
+    ];
+    let _ = out_tx.send(OutputMessage::Bytes(telnet_neg)).await;
     let _ = out_tx
         .send(OutputMessage::Bytes(
             b"\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l".to_vec(),
@@ -1080,34 +1151,55 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
 
     loop {
         tokio::select! {
-            maybe_cmd = cmd_rx.recv() => {
-                let cmd = match maybe_cmd {
-                    Some(cmd) => cmd,
-                    None => String::from("__disconnect__"),
+            maybe_event = input_rx.recv() => {
+                let event = match maybe_event {
+                    Some(e) => e,
+                    None => InputEvent::Disconnect,
                 };
-                match session.handle_command(&cmd, &assets).await {
-                    CommandAction::Exit => {
-                        reader_task.abort();
-                        let _ = reader_task.await;
-                        let _ = out_tx.send(OutputMessage::Close { send_bye: true }).await;
-                        break;
+                match event {
+                    InputEvent::Typing(text) => {
+                        session.current_input = text;
+                        // Force a frame update so the typing is visible immediately
+                        if out_tx.capacity() > 0 {
+                            session.render(&assets, &mut buffers);
+                            let frame = session.compose_frame(&buffers);
+                            last_frame_hash = fast_hash(frame.as_bytes());
+                            let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+                        }
                     }
-                    CommandAction::Disconnect => {
+                    InputEvent::Command(cmd) => {
+                        session.current_input.clear();
+                        match session.handle_command(&cmd, &assets).await {
+                            CommandAction::Exit => {
+                                reader_task.abort();
+                                let _ = reader_task.await;
+                                let _ = out_tx.send(OutputMessage::Close { send_bye: true }).await;
+                                break;
+                            }
+                            CommandAction::Disconnect => {
+                                reader_task.abort();
+                                let _ = reader_task.await;
+                                let _ = out_tx.send(OutputMessage::Close { send_bye: false }).await;
+                                break;
+                            }
+                            CommandAction::None => {}
+                        }
+
+                        if out_tx.capacity() > 0 {
+                            session.render(&assets, &mut buffers);
+                            let frame = session.compose_frame(&buffers);
+                            let hash = fast_hash(frame.as_bytes());
+                            if hash != last_frame_hash {
+                                last_frame_hash = hash;
+                                let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+                            }
+                        }
+                    }
+                    InputEvent::Disconnect => {
                         reader_task.abort();
                         let _ = reader_task.await;
                         let _ = out_tx.send(OutputMessage::Close { send_bye: false }).await;
                         break;
-                    }
-                    CommandAction::None => {}
-                }
-
-                if out_tx.capacity() > 0 {
-                    session.render(&assets, &mut buffers);
-                    let frame = session.compose_frame(&buffers);
-                    let hash = fast_hash(frame.as_bytes());
-                    if hash != last_frame_hash {
-                        last_frame_hash = hash;
-                        let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
                     }
                 }
             }
