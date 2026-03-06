@@ -1,4 +1,7 @@
 # Poke-Stream
+
+![CI](https://github.com/adi-suresh01/poke-stream/actions/workflows/ci.yml/badge.svg)
+
 Visit [https://pokestream.me](https://pokestream.me) for product details
 
 ![Arcanine animation](arcanine.gif)
