@@ -6,3 +6,5 @@
 pokedex.db
 context.md
 website.md
+latency-report.md
+bench-latency.sh

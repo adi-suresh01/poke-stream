@@ -1,0 +1,16 @@
+[Unit]
+Description=Poke-Stream Telnet Game Server
+After=network.target
+
+[Service]
+Type=simple
+User=cloud9
+WorkingDirectory=/home/cloud9/poke-stream
+ExecStart=/home/cloud9/poke-stream/server
+Restart=on-failure
+RestartSec=3
+Environment=POKESTREAM_COLOR=ansi256
+Environment=POKESTREAM_PORT=8080
+
+[Install]
+WantedBy=multi-user.target

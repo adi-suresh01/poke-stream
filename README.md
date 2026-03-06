@@ -44,6 +44,7 @@ The main loop renders the rotating Pokeball and a random Pokemon sprite. Players
 Commands:
 - `catch` to throw the Pokeball
 - `pokedex` or `dex` to open the Pokedex
+- Ask plain-text questions such as `what is this pokemon?`, `how many pokemon do i have left to catch?`, `which pokemon am i missing?`
 - `q`, `quit`, or `exit` to leave
 
 ### Pokedex Screen (Captured Grid)
@@ -72,6 +73,8 @@ Type quit
 ## Architecture Summary
 - **Session model**: `src/main.rs` binds on `0.0.0.0:8080` and spawns one Tokio task per connection. Each task maintains its own `SessionState` with render buffers, game state, and trainer Pokedex.
 - **Screen state machine**: `Screen::Name`, `Screen::Game`, `Screen::Pokedex`, `Screen::PokedexDetail` drive the input handling, animation updates, and render output.
+- **Agent layer**: built-in text Q&A for pokemon identification and dex progress, with optional Anthropic fallback for broader questions.
+- **Safety hooks**: optional White Circle-style guard webhook for request/response filtering before answers are shown.
 - **Game state machine**: `Idle`, `Throwing`, `Opening`, `Absorbing`, `Closing`, `Shaking`, `StarHold` define the capture flow, including stream particles and star burst timing.
 - **Renderer**:
   - **2D layer**: ASCII Pokemon sprites with per-character color from `src/ascii.rs`.
@@ -88,6 +91,10 @@ Color mode selection (optional):
 - `POKESTREAM_COLOR=mono` or `none`
 
 If unset, the server auto-detects color support via `COLORTERM` and `TERM`.
+
+Agent configuration (optional):
+- `OLLAMA_URL` overrides Ollama endpoint (default `http://127.0.0.1:11434`).
+- `OLLAMA_MODEL` overrides default model (default `qwen2.5:1.5b`).
 
 ## Tech Stack
 - Rust (edition 2024)

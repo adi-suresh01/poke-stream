@@ -2,19 +2,19 @@ mod ascii;
 mod pokemon;
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 use std::env;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fmt::Write;
 use std::fs;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::{self, Duration, MissedTickBehavior};
 use tokio::task;
+use tokio::time::{self, Duration, MissedTickBehavior};
 
 #[derive(PartialEq)]
 enum GameState {
@@ -103,6 +103,22 @@ struct StreamParticle {
     start_frame: u16,
 }
 
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
+fn pokemon_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 const IMG_CHARSET: &str =
     ".'`^\",:;Il!i><~+_-?][}{1)(|\\/*tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$Ñ";
 
@@ -151,6 +167,8 @@ struct SessionState {
     caught_message_timer: u16,
     pokedex_notice: Option<String>,
     pokedex_notice_timer: u16,
+    agent_message: Option<String>,
+    agent_message_timer: u16,
     floor_y: f32,
     ball_x: f32,
     ball_y: f32,
@@ -203,6 +221,8 @@ impl SessionState {
             caught_message_timer: 0,
             pokedex_notice: None,
             pokedex_notice_timer: 0,
+            agent_message: None,
+            agent_message_timer: 0,
             floor_y: 5.0,
             ball_x: -45.0,
             ball_y: 5.0,
@@ -222,15 +242,118 @@ impl SessionState {
         &assets.pokemons[self.pokemon_index]
     }
 
+    fn set_agent_message(&mut self, message: String) {
+        let normalized = normalize_whitespace(&message);
+        let max_len = self.width.saturating_sub(4).max(20);
+        let clipped = clip_text(&normalized, max_len);
+        self.agent_message = Some(clipped);
+        self.agent_message_timer = 180;
+    }
+
+    fn screen_label(&self) -> &'static str {
+        match self.screen {
+            Screen::Name => "name",
+            Screen::Pokedex => "pokedex",
+            Screen::PokedexDetail => "pokedex_detail",
+            Screen::Game => "game",
+        }
+    }
+
+    fn dex_progress(&self, assets: &Assets) -> (usize, usize, usize) {
+        let total = assets
+            .pokedex
+            .names
+            .iter()
+            .filter(|name| !name.is_empty())
+            .count();
+        let caught = assets
+            .pokedex
+            .names
+            .iter()
+            .filter(|name| !name.is_empty() && self.pokedex.contains(*name))
+            .count();
+        let left = total.saturating_sub(caught);
+        (caught, total, left)
+    }
+
+    async fn answer_query_with_agent(&mut self, user_input: &str, assets: &Assets) -> bool {
+        let normalized = normalize_whitespace(user_input);
+        if normalized.is_empty() || !looks_like_agent_query_candidate(&normalized) {
+            return false;
+        }
+
+        let trainer_name = self.trainer_name.clone();
+        let current_pokemon = if matches!(self.screen, Screen::Game) {
+            Some(self.pokemon(assets).name.clone())
+        } else {
+            None
+        };
+        let screen = self.screen_label().to_string();
+        let (caught_count, total_count, left_count) = self.dex_progress(assets);
+
+        let query = normalized.to_lowercase();
+
+        let response = if is_agent_pokemon_query(&query) {
+            if let Some(pokemon_name) = current_pokemon.as_deref() {
+                fetch_pokemon_brief(pokemon_name).await.unwrap_or_else(|| {
+                    format!(
+                        "Agent: current pokemon is {}.",
+                        display_pokemon_name(pokemon_name)
+                    )
+                })
+            } else {
+                "Agent: I can identify pokemon from the catch screen.".to_string()
+            }
+        } else if is_agent_left_to_catch_query(&query) {
+            format!(
+                "Agent: you caught {caught_count}/{total_count}. {left_count} pokemon left to catch."
+            )
+        } else if is_agent_caught_count_query(&query) {
+            format!("Agent: you currently have {caught_count} out of {total_count} pokemon.")
+        } else if is_agent_missing_list_query(&query) {
+            let missing = missing_pokemon_preview(&self.pokedex, assets, 8);
+            if missing.is_empty() {
+                "Agent: your Gen 1 dex is complete. Legendaries are unlocked.".to_string()
+            } else {
+                format!(
+                    "Agent: you are missing {}. Next few: {}.",
+                    left_count,
+                    missing.join(", ")
+                )
+            }
+        } else if query == "help" || query.contains("what can you do") {
+            "Agent: ask things like 'what is this pokemon?', 'how many pokemon do i have left?', or 'which pokemon am i missing?'.".to_string()
+        } else {
+            ask_llm_brief(
+                &normalized,
+                &screen,
+                trainer_name.as_deref(),
+                current_pokemon.as_deref(),
+                caught_count,
+                total_count,
+                left_count,
+            )
+            .await
+            .unwrap_or_else(|| {
+                "Agent: I can answer pokemon identification and dex progress questions.".to_string()
+            })
+        };
+
+        self.set_agent_message(response);
+        true
+    }
+
     async fn handle_command(&mut self, cmd: &str, assets: &Assets) -> CommandAction {
-        let cmd_trim = cmd.trim().to_lowercase();
+        let raw_cmd = cmd.trim().to_lowercase();
+        let cmd_trim = raw_cmd.clone();
+
         if cmd.as_bytes().contains(&3) || matches!(cmd_trim.as_str(), "q" | "quit" | "exit") {
             return CommandAction::Exit;
         }
         if cmd_trim == "__disconnect__" {
             return CommandAction::Disconnect;
         }
-        self.last_cmd = cmd_trim.clone();
+        self.last_cmd = raw_cmd;
         match self.screen {
             Screen::Name => {
                 if let Some(name) = sanitize_trainer_name(&cmd_trim) {
@@ -265,11 +388,15 @@ impl SessionState {
                             }
                         }
                     }
+                } else if self.answer_query_with_agent(&cmd_trim, assets).await {
+                    return CommandAction::None;
                 }
             }
             Screen::PokedexDetail => {
                 if cmd_trim == "back" {
                     self.screen = Screen::Pokedex;
+                } else if self.answer_query_with_agent(&cmd_trim, assets).await {
+                    return CommandAction::None;
                 }
             }
             Screen::Game => {
@@ -277,12 +404,13 @@ impl SessionState {
                     self.state = GameState::Throwing;
                     self.frame_count = 0;
                     self.capture_recorded = false;
-                }
-                if cmd_trim == "pokedex" || cmd_trim == "dex" {
+                } else if cmd_trim == "pokedex" || cmd_trim == "dex" {
                     self.screen = Screen::Pokedex;
                     self.pokedex_detail = None;
                     self.pokedex_notice = None;
                     self.pokedex_notice_timer = 0;
+                } else if self.answer_query_with_agent(&cmd_trim, assets).await {
+                    return CommandAction::None;
                 }
             }
         }
@@ -290,6 +418,13 @@ impl SessionState {
     }
 
     async fn update(&mut self, assets: &Assets) {
+        if self.agent_message_timer > 0 {
+            self.agent_message_timer = self.agent_message_timer.saturating_sub(1);
+            if self.agent_message_timer == 0 {
+                self.agent_message = None;
+            }
+        }
+
         if self.selection_mode == SelectionMode::DailyWeighted
             && self.trainer_name.is_some()
             && self.state == GameState::Idle
@@ -424,7 +559,8 @@ impl SessionState {
                 if self.welcome_accum >= self.welcome_frame_ms {
                     self.welcome_accum = 0;
                     if !assets.arcanine_frames.is_empty() {
-                        self.welcome_frame = (self.welcome_frame + 1) % assets.arcanine_frames.len();
+                        self.welcome_frame =
+                            (self.welcome_frame + 1) % assets.arcanine_frames.len();
                     }
                 }
             }
@@ -461,7 +597,8 @@ impl SessionState {
         match self.screen {
             Screen::Name => {
                 if !assets.arcanine_frames.is_empty() {
-                    let frame = &assets.arcanine_frames[self.welcome_frame % assets.arcanine_frames.len()];
+                    let frame =
+                        &assets.arcanine_frames[self.welcome_frame % assets.arcanine_frames.len()];
                     let start_x = (self.width.saturating_sub(frame.width)) / 2;
                     let start_y = (self.height.saturating_sub(frame.height)) / 2;
 
@@ -510,7 +647,10 @@ impl SessionState {
             }
             Screen::Game => {
                 let pokemon = self.pokemon(assets);
-                if matches!(self.state, GameState::Idle | GameState::Throwing | GameState::Opening) {
+                if matches!(
+                    self.state,
+                    GameState::Idle | GameState::Throwing | GameState::Opening
+                ) {
                     let grow_start_y = 5;
                     let grow_start_x = (self.width / 2) - 2;
 
@@ -605,10 +745,10 @@ impl SessionState {
 
                         let xp = (self.width as f32 / 2.0
                             + self.ball_x
-                            + 30.0 * ooz * x_final * self.aspect_ratio) as i32;
-                        let yp = (self.height as f32 / 2.0
-                            + self.ball_y
-                            + 18.0 * ooz * y_final) as i32;
+                            + 30.0 * ooz * x_final * self.aspect_ratio)
+                            as i32;
+                        let yp =
+                            (self.height as f32 / 2.0 + self.ball_y + 18.0 * ooz * y_final) as i32;
 
                         if xp >= 0 && xp < self.width as i32 && yp >= 0 && yp < self.height as i32 {
                             let idx = (xp + yp * self.width as i32) as usize;
@@ -624,7 +764,8 @@ impl SessionState {
                                     let spec = (rz * -1.0).max(0.0).powf(16.0);
                                     let shade = (0.12 + diffuse * 0.9 + spec * 0.6).min(1.0);
 
-                                    let mut l_idx = (shade * (self.chars.len() - 1) as f32) as usize;
+                                    let mut l_idx =
+                                        (shade * (self.chars.len() - 1) as f32) as usize;
                                     if l_idx >= self.chars.len() {
                                         l_idx = self.chars.len() - 1;
                                     }
@@ -694,11 +835,32 @@ impl SessionState {
             }
         }
 
+        if let Screen::Game = self.screen {
+            if let Some(message) = self.agent_message.as_ref() {
+                if self.agent_message_timer > 0 {
+                    let row = self.height.saturating_sub(5);
+                    let start_x = (self.width.saturating_sub(message.len())) / 2;
+                    for (i, ch) in message.chars().enumerate() {
+                        let x = start_x + i;
+                        if x >= self.width || row >= self.height {
+                            continue;
+                        }
+                        let idx = x + row * self.width;
+                        output[idx] = ch;
+                        color_buf[idx] = CellColor::Ansi("\x1b[96m");
+                        zbuffer[idx] = 0.45;
+                    }
+                }
+            }
+        }
+
         let prompt = match self.screen {
             Screen::Name => "enter a unique trainer name to begin catching (q to quit)",
             Screen::Pokedex => "type a caught number (1-151), or 'back' to return (q to quit)",
             Screen::PokedexDetail => "type 'back' to return to the pokedex (q to quit)",
-            Screen::Game => "type 'catch' to throw, or 'pokedex' to view your dex (q to quit)",
+            Screen::Game => {
+                "type 'catch'/'pokedex' or ask a question like 'what is this pokemon?' (q to quit)"
+            }
         };
         let prompt_line = format!("command: {} ({})", self.last_cmd, prompt);
         let prompt_row = self.height.saturating_sub(1);
@@ -807,12 +969,8 @@ impl SessionState {
         self.daily_key = day;
         let legendary_unlocked = legendaries_unlocked(&self.pokedex, &assets.pokedex.names);
         let seed = daily_seed(name, day);
-        self.pokemon_index = pick_weighted_pokemon(
-            &assets.pokemons,
-            &assets.pokedex,
-            seed,
-            legendary_unlocked,
-        );
+        self.pokemon_index =
+            pick_weighted_pokemon(&assets.pokemons, &assets.pokedex, seed, legendary_unlocked);
         self.stream_particles.clear();
         self.caught_message = None;
         self.caught_message_timer = 0;
@@ -842,6 +1000,7 @@ async fn main() -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     loop {
         let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let assets = Arc::clone(&assets);
         tokio::spawn(async move {
             let _ = run_session(stream, assets).await;
@@ -850,7 +1009,7 @@ async fn main() -> io::Result<()> {
 }
 
 async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
@@ -917,6 +1076,7 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
     let frame_interval = frame_interval_from_env();
     let mut ticker = time::interval(frame_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_frame_hash: u64 = 0;
 
     loop {
         tokio::select! {
@@ -944,7 +1104,11 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                 if out_tx.capacity() > 0 {
                     session.render(&assets, &mut buffers);
                     let frame = session.compose_frame(&buffers);
-                    let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+                    let hash = fast_hash(frame.as_bytes());
+                    if hash != last_frame_hash {
+                        last_frame_hash = hash;
+                        let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -954,7 +1118,11 @@ async fn run_session(stream: TcpStream, assets: Arc<Assets>) -> io::Result<()> {
                 session.update(&assets).await;
                 session.render(&assets, &mut buffers);
                 let frame = session.compose_frame(&buffers);
-                let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+                let hash = fast_hash(frame.as_bytes());
+                if hash != last_frame_hash {
+                    last_frame_hash = hash;
+                    let _ = out_tx.try_send(OutputMessage::Bytes(frame.into_bytes()));
+                }
             }
         }
     }
@@ -1123,7 +1291,10 @@ fn env_usize(key: &str) -> Option<usize> {
 fn selection_mode_from_env() -> SelectionMode {
     if let Ok(mode) = env::var("POKESTREAM_MODE") {
         let mode = mode.to_lowercase();
-        if matches!(mode.as_str(), "random" | "dev_random" | "random_per_session") {
+        if matches!(
+            mode.as_str(),
+            "random" | "dev_random" | "random_per_session"
+        ) {
             return SelectionMode::RandomPerSession;
         }
     }
@@ -1280,14 +1451,17 @@ fn pick_weighted_pokemon(
     0
 }
 
-
 fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     // 16-231: 6x6x6 color cube, 232-255: grayscale
     let r = r as u16;
     let g = g as u16;
     let b = b as u16;
     let gray = (r + g + b) / 3;
-    if gray > 8 && gray < 248 && (r as i16 - g as i16).abs() < 12 && (r as i16 - b as i16).abs() < 12 {
+    if gray > 8
+        && gray < 248
+        && (r as i16 - g as i16).abs() < 12
+        && (r as i16 - b as i16).abs() < 12
+    {
         let gray_index = ((gray - 8) * 24 / 247) as u8;
         return 232 + gray_index;
     }
@@ -1416,6 +1590,290 @@ fn display_pokemon_name(name: &str) -> String {
         }
     }
     out
+}
+
+fn is_agent_pokemon_query(phrase: &str) -> bool {
+    let phrase = phrase.trim();
+    phrase.contains("what pokemon is this")
+        || phrase.contains("who is this pokemon")
+        || phrase.contains("what is this creature")
+        || phrase.contains("what is this pokemon")
+        || phrase.contains("identify this")
+        || phrase.contains("tell me about this")
+        || phrase.contains("what the hell is this")
+}
+
+fn is_agent_left_to_catch_query(phrase: &str) -> bool {
+    let phrase = phrase.trim();
+    phrase.contains("how many")
+        && (phrase.contains("left")
+            || phrase.contains("remaining")
+            || phrase.contains("to catch")
+            || phrase.contains("missing"))
+}
+
+fn is_agent_caught_count_query(phrase: &str) -> bool {
+    let phrase = phrase.trim();
+    (phrase.contains("how many") || phrase.contains("count"))
+        && (phrase.contains("caught") || phrase.contains("have i"))
+}
+
+fn is_agent_missing_list_query(phrase: &str) -> bool {
+    let phrase = phrase.trim();
+    phrase.contains("which pokemon am i missing")
+        || phrase.contains("what am i missing")
+        || (phrase.contains("show") && phrase.contains("missing"))
+}
+
+fn looks_like_agent_query_candidate(text: &str) -> bool {
+    let text = text.trim().to_lowercase();
+    if text.is_empty() {
+        return false;
+    }
+    if matches!(
+        text.as_str(),
+        "catch" | "pokedex" | "dex" | "back" | "q" | "quit" | "exit"
+    ) {
+        return false;
+    }
+    if text.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    text.ends_with('?')
+        || text.contains(' ')
+        || matches!(text.as_str(), "help" | "status" | "progress" | "missing")
+}
+
+fn fast_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clip_text(text: &str, max_chars: usize) -> String {
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return text.chars().take(max_chars).collect();
+    }
+    let mut out = String::new();
+    for ch in text.chars().take(max_chars - 3) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn missing_pokemon_preview(caught: &HashSet<String>, assets: &Assets, limit: usize) -> Vec<String> {
+    assets
+        .pokedex
+        .names
+        .iter()
+        .filter(|name| !name.is_empty() && !caught.contains(*name))
+        .take(limit)
+        .map(|name| display_pokemon_name(name))
+        .collect()
+}
+
+fn ollama_url() -> String {
+    env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string())
+}
+
+fn ollama_model() -> String {
+    env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:1.5b".to_string())
+}
+
+async fn ask_llm_brief(
+    user_query: &str,
+    screen: &str,
+    trainer_name: Option<&str>,
+    current_pokemon: Option<&str>,
+    caught_count: usize,
+    total_count: usize,
+    left_count: usize,
+) -> Option<String> {
+    let prompt = format!(
+        "You are Pokestream Agent inside a telnet Pokemon game. \
+        Keep responses concise, under 200 characters. Only answer in-game questions. \
+        Context: screen={screen}, trainer={}, pokemon={}, caught={caught_count}/{total_count}, left={left_count}.\n\
+        User: {user_query}",
+        trainer_name.unwrap_or("unknown"),
+        current_pokemon.unwrap_or("unknown"),
+    );
+
+    let payload = serde_json::json!({
+        "model": ollama_model(),
+        "prompt": prompt,
+        "stream": false,
+        "keep_alive": "10m",
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 40,
+        }
+    });
+
+    let url = format!("{}/api/generate", ollama_url());
+    let client = shared_http_client();
+    let response = match tokio::time::timeout(
+        Duration::from_secs(8),
+        client.post(&url).json(&payload).send(),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp.error_for_status().ok()?,
+        _ => return None,
+    };
+    let body: serde_json::Value = response.json().await.ok()?;
+
+    let text = body.get("response").and_then(|v| v.as_str())?;
+    let cleaned = normalize_whitespace(text);
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let answer = format!("Agent: {}", cleaned);
+    Some(clip_text(&normalize_whitespace(&answer), 220))
+}
+
+async fn fetch_pokemon_brief(name: &str) -> Option<String> {
+    if let Ok(cache) = pokemon_cache().lock() {
+        if let Some(cached) = cache.get(name) {
+            return Some(cached.clone());
+        }
+    }
+
+    let client = shared_http_client();
+    let url = format!("https://pokeapi.co/api/v2/pokemon/{name}");
+    let pokemon: serde_json::Value = client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let mut type_slots: Vec<(i64, String)> = Vec::new();
+    if let Some(types) = pokemon.get("types").and_then(|v| v.as_array()) {
+        for entry in types {
+            let slot = entry.get("slot").and_then(|v| v.as_i64()).unwrap_or(99);
+            if let Some(type_name) = entry
+                .get("type")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+            {
+                type_slots.push((slot, type_name.to_string()));
+            }
+        }
+    }
+    type_slots.sort_by_key(|(slot, _)| *slot);
+    let type_text = if type_slots.is_empty() {
+        "unknown".to_string()
+    } else {
+        type_slots
+            .into_iter()
+            .map(|(_, ty)| ty)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+
+    let mut hp = None;
+    let mut atk = None;
+    let mut def = None;
+    if let Some(stats) = pokemon.get("stats").and_then(|v| v.as_array()) {
+        for stat in stats {
+            let Some(stat_name) = stat
+                .get("stat")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let Some(value) = stat.get("base_stat").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            match stat_name {
+                "hp" => hp = Some(value),
+                "attack" => atk = Some(value),
+                "defense" => def = Some(value),
+                _ => {}
+            }
+        }
+    }
+
+    let flavor = if let Some(species_url) = pokemon
+        .get("species")
+        .and_then(|v| v.get("url"))
+        .and_then(|v| v.as_str())
+    {
+        fetch_species_flavor(&client, species_url).await
+    } else {
+        None
+    };
+
+    let mut message = format!(
+        "Agent: {} ({}). HP {} ATK {} DEF {}.",
+        display_pokemon_name(name),
+        type_text,
+        hp.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()),
+        atk.map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        def.map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    );
+    if let Some(flavor) = flavor {
+        message.push(' ');
+        message.push_str(&flavor);
+    }
+    let result = clip_text(&normalize_whitespace(&message), 220);
+    if let Ok(mut cache) = pokemon_cache().lock() {
+        cache.insert(name.to_string(), result.clone());
+    }
+    Some(result)
+}
+
+async fn fetch_species_flavor(client: &reqwest::Client, species_url: &str) -> Option<String> {
+    let species: serde_json::Value = client
+        .get(species_url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let entries = species.get("flavor_text_entries")?.as_array()?;
+    for entry in entries {
+        if entry
+            .get("language")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            != Some("en")
+        {
+            continue;
+        }
+        let Some(raw) = entry.get("flavor_text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let cleaned = raw.replace(['\n', '\r', '\u{000c}'], " ");
+        let cleaned = normalize_whitespace(&cleaned);
+        if !cleaned.is_empty() {
+            return Some(clip_text(&cleaned, 140));
+        }
+    }
+    None
 }
 
 fn find_pokemon_asset<'a>(assets: &'a Assets, name: &str) -> Option<&'a PokemonAsset> {
@@ -1553,7 +2011,6 @@ fn render_pokedex_detail(
     }
 }
 
-
 fn sanitize_trainer_name(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -1573,8 +2030,8 @@ fn sanitize_trainer_name(input: &str) -> Option<String> {
 
 async fn init_db() -> io::Result<()> {
     task::spawn_blocking(|| -> io::Result<()> {
-        let conn = Connection::open(DB_PATH)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let conn =
+            Connection::open(DB_PATH).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         conn.execute(
@@ -1594,12 +2051,14 @@ async fn init_db() -> io::Result<()> {
 async fn load_pokedex(name: &str) -> io::Result<HashSet<String>> {
     let name = name.to_string();
     task::spawn_blocking(move || -> io::Result<HashSet<String>> {
-        let conn = Connection::open(DB_PATH)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let conn =
+            Connection::open(DB_PATH).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         let json: Option<String> = conn
-            .query_row("SELECT pokedex FROM trainers WHERE name = ?1", [&name], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT pokedex FROM trainers WHERE name = ?1",
+                [&name],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         let list: Vec<String> = match json {
@@ -1617,11 +2076,11 @@ async fn save_pokedex(name: &str, pokedex: &HashSet<String>) -> io::Result<()> {
     let name = name.to_string();
     let mut list: Vec<String> = pokedex.iter().cloned().collect();
     list.sort();
-    let payload = serde_json::to_string(&list)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let payload =
+        serde_json::to_string(&list).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     task::spawn_blocking(move || -> io::Result<()> {
-        let conn = Connection::open(DB_PATH)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let conn =
+            Connection::open(DB_PATH).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         conn.execute(
             "INSERT INTO trainers (name, pokedex)
              VALUES (?1, ?2)
