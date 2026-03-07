@@ -15,6 +15,7 @@ Terminal-hosted Pokemon game with real-time ASCII animation. Players connect ove
 - Async TCP server that spawns a session task per client.
 - Asset pipeline that converts PNG/JPG/GIF into colored ASCII frames.
 - Pokedex grid with per-trainer capture tracking and entry detail view.
+- In-game agent: ask natural language questions to identify Pokemon, get Pokedex descriptions, view stats, and track dex progress — powered by local LLM (Ollama) and PokeAPI with in-memory caching.
 
 ## Play (Public Server)
 From any terminal with Telnet installed:
@@ -47,7 +48,10 @@ The main loop renders the rotating Pokeball and a random Pokemon sprite. Players
 Commands:
 - `catch` to throw the Pokeball
 - `pokedex` or `dex` to open the Pokedex
-- Ask plain-text questions such as `what is this pokemon?`, `how many pokemon do i have left to catch?`, `which pokemon am i missing?`
+- `what is this pokemon?` to get Pokedex-style identification with type and description
+- `stats` to view the current Pokemon's base stats (HP, ATK, DEF, SP.ATK, SP.DEF, SPD)
+- `how many pokemon do i have left to catch?` to check dex progress
+- `which pokemon am i missing?` to see uncaught Pokemon
 - `q`, `quit`, or `exit` to leave
 
 ### Pokedex Screen (Captured Grid)
@@ -76,8 +80,7 @@ Type quit
 ## Architecture Summary
 - **Session model**: `src/main.rs` binds on `0.0.0.0:8080` and spawns one Tokio task per connection. Each task maintains its own `SessionState` with render buffers, game state, and trainer Pokedex.
 - **Screen state machine**: `Screen::Name`, `Screen::Game`, `Screen::Pokedex`, `Screen::PokedexDetail` drive the input handling, animation updates, and render output.
-- **Agent layer**: built-in text Q&A for pokemon identification and dex progress, with optional Anthropic fallback for broader questions.
-- **Safety hooks**: optional White Circle-style guard webhook for request/response filtering before answers are shown.
+- **Agent layer**: built-in Pokemon identification with Pokedex descriptions from PokeAPI (cached in-memory), stats lookup, dex progress tracking, and local LLM fallback via Ollama for open-ended questions.
 - **Game state machine**: `Idle`, `Throwing`, `Opening`, `Absorbing`, `Closing`, `Shaking`, `StarHold` define the capture flow, including stream particles and star burst timing.
 - **Renderer**:
   - **2D layer**: ASCII Pokemon sprites with per-character color from `src/ascii.rs`.
@@ -103,6 +106,8 @@ Agent configuration (optional):
 - Rust (edition 2024)
 - Tokio for async networking
 - Image crate for asset decoding and GIF frames
+- Ollama for local LLM inference (qwen2.5:1.5b default)
+- PokeAPI for Pokemon data with in-memory response caching
 
 ## Project Context
 This project is a terminal-native, distributed-systems style experiment: a single server process accepts multiple Telnet sessions and runs an independent animation loop per client. The goal is to support many concurrent users with low latency rendering while keeping everything in ASCII.
