@@ -15,7 +15,7 @@ Terminal-hosted Pokemon game with real-time ASCII animation. Players connect ove
 - Async TCP server that spawns a session task per client.
 - Asset pipeline that converts PNG/JPG/GIF into colored ASCII frames.
 - Pokedex grid with per-trainer capture tracking and entry detail view.
-- In-game agent: ask natural language questions to identify Pokemon, get Pokedex descriptions, view stats, and track dex progress — powered by local LLM (Ollama) and PokeAPI with in-memory caching.
+- In-game agent: ask natural language questions to identify Pokemon, get Pokedex descriptions, view stats, and track dex progress, powered by local LLM (Ollama) and PokeAPI with in-memory caching.
 
 ## Play (Public Server)
 From any terminal with Telnet installed:
