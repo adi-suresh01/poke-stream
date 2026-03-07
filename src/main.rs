@@ -167,7 +167,7 @@ struct SessionState {
     caught_message_timer: u16,
     pokedex_notice: Option<String>,
     pokedex_notice_timer: u16,
-    agent_message: Option<String>,
+    agent_lines: Vec<String>,
     agent_message_timer: u16,
     floor_y: f32,
     ball_x: f32,
@@ -221,7 +221,7 @@ impl SessionState {
             caught_message_timer: 0,
             pokedex_notice: None,
             pokedex_notice_timer: 0,
-            agent_message: None,
+            agent_lines: Vec::new(),
             agent_message_timer: 0,
             floor_y: 5.0,
             ball_x: -45.0,
@@ -244,10 +244,10 @@ impl SessionState {
 
     fn set_agent_message(&mut self, message: String) {
         let normalized = normalize_whitespace(&message);
-        let max_len = self.width.saturating_sub(4).max(20);
-        let clipped = clip_text(&normalized, max_len);
-        self.agent_message = Some(clipped);
-        self.agent_message_timer = 180;
+        let max_w = self.width.saturating_sub(6).max(20);
+        self.agent_lines = word_wrap(&normalized, max_w);
+        self.agent_lines.truncate(4);
+        self.agent_message_timer = 220;
     }
 
     fn screen_label(&self) -> &'static str {
@@ -293,7 +293,18 @@ impl SessionState {
 
         let query = normalized.to_lowercase();
 
-        let response = if is_agent_pokemon_query(&query) {
+        let response = if is_agent_stats_query(&query) {
+            if let Some(pokemon_name) = current_pokemon.as_deref() {
+                fetch_pokemon_stats(pokemon_name).await.unwrap_or_else(|| {
+                    format!(
+                        "Agent: current pokemon is {}.",
+                        display_pokemon_name(pokemon_name)
+                    )
+                })
+            } else {
+                "Agent: I can show stats from the catch screen.".to_string()
+            }
+        } else if is_agent_pokemon_query(&query) {
             if let Some(pokemon_name) = current_pokemon.as_deref() {
                 fetch_pokemon_brief(pokemon_name).await.unwrap_or_else(|| {
                     format!(
@@ -421,7 +432,7 @@ impl SessionState {
         if self.agent_message_timer > 0 {
             self.agent_message_timer = self.agent_message_timer.saturating_sub(1);
             if self.agent_message_timer == 0 {
-                self.agent_message = None;
+                self.agent_lines.clear();
             }
         }
 
@@ -836,19 +847,24 @@ impl SessionState {
         }
 
         if let Screen::Game = self.screen {
-            if let Some(message) = self.agent_message.as_ref() {
-                if self.agent_message_timer > 0 {
-                    let row = self.height.saturating_sub(5);
-                    let start_x = (self.width.saturating_sub(message.len())) / 2;
-                    for (i, ch) in message.chars().enumerate() {
+            if !self.agent_lines.is_empty() && self.agent_message_timer > 0 {
+                let num_lines = self.agent_lines.len();
+                let base_row = self.height.saturating_sub(2 + num_lines);
+                let start_x = 3;
+                for (li, line) in self.agent_lines.iter().enumerate() {
+                    let row = base_row + li;
+                    if row >= self.height {
+                        continue;
+                    }
+                    for (i, ch) in line.chars().enumerate() {
                         let x = start_x + i;
-                        if x >= self.width || row >= self.height {
-                            continue;
+                        if x >= self.width {
+                            break;
                         }
                         let idx = x + row * self.width;
                         output[idx] = ch;
                         color_buf[idx] = CellColor::Ansi("\x1b[96m");
-                        zbuffer[idx] = 0.45;
+                        zbuffer[idx] = 0.9;
                     }
                 }
             }
@@ -1592,6 +1608,16 @@ fn display_pokemon_name(name: &str) -> String {
     out
 }
 
+fn is_agent_stats_query(phrase: &str) -> bool {
+    let phrase = phrase.trim();
+    phrase.contains("stats")
+        || phrase.contains("base stat")
+        || (phrase.contains("hp") && phrase.contains("atk"))
+        || phrase.contains("how strong")
+        || phrase.contains("what are its stats")
+        || phrase.contains("show me stats")
+}
+
 fn is_agent_pokemon_query(phrase: &str) -> bool {
     let phrase = phrase.trim();
     phrase.contains("what pokemon is this")
@@ -1642,6 +1668,26 @@ fn looks_like_agent_query_candidate(text: &str) -> bool {
     text.ends_with('?')
         || text.contains(' ')
         || matches!(text.as_str(), "help" | "status" | "progress" | "missing")
+}
+
+fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current = word.to_string();
+        } else if current.len() + 1 + word.len() <= max_width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn fast_hash(data: &[u8]) -> u64 {
@@ -1822,25 +1868,68 @@ async fn fetch_pokemon_brief(name: &str) -> Option<String> {
         None
     };
 
-    let mut message = format!(
-        "Agent: {} ({}). HP {} ATK {} DEF {}.",
-        display_pokemon_name(name),
-        type_text,
-        hp.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()),
-        atk.map(|v| v.to_string())
-            .unwrap_or_else(|| "?".to_string()),
-        def.map(|v| v.to_string())
-            .unwrap_or_else(|| "?".to_string())
-    );
-    if let Some(flavor) = flavor {
-        message.push(' ');
-        message.push_str(&flavor);
-    }
-    let result = clip_text(&normalize_whitespace(&message), 220);
+    let message = if let Some(flavor) = flavor {
+        format!(
+            "Agent: {} is a {}-type Pokemon. {}",
+            display_pokemon_name(name),
+            type_text,
+            flavor
+        )
+    } else {
+        format!(
+            "Agent: {} is a {}-type Pokemon.",
+            display_pokemon_name(name),
+            type_text
+        )
+    };
+    let result = normalize_whitespace(&message);
     if let Ok(mut cache) = pokemon_cache().lock() {
         cache.insert(name.to_string(), result.clone());
     }
     Some(result)
+}
+
+async fn fetch_pokemon_stats(name: &str) -> Option<String> {
+    let client = shared_http_client();
+    let url = format!("https://pokeapi.co/api/v2/pokemon/{name}");
+    let pokemon: serde_json::Value = client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let mut stats_list = Vec::new();
+    if let Some(stats) = pokemon.get("stats").and_then(|v| v.as_array()) {
+        for stat in stats {
+            let stat_name = stat
+                .get("stat")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let value = stat.get("base_stat").and_then(|v| v.as_i64()).unwrap_or(0);
+            let label = match stat_name {
+                "hp" => "HP",
+                "attack" => "ATK",
+                "defense" => "DEF",
+                "special-attack" => "SP.ATK",
+                "special-defense" => "SP.DEF",
+                "speed" => "SPD",
+                other => other,
+            };
+            stats_list.push(format!("{label} {value}"));
+        }
+    }
+    let message = format!(
+        "Agent: {} stats: {}.",
+        display_pokemon_name(name),
+        stats_list.join(", ")
+    );
+    Some(clip_text(&normalize_whitespace(&message), 400))
 }
 
 async fn fetch_species_flavor(client: &reqwest::Client, species_url: &str) -> Option<String> {
@@ -1870,7 +1959,7 @@ async fn fetch_species_flavor(client: &reqwest::Client, species_url: &str) -> Op
         let cleaned = raw.replace(['\n', '\r', '\u{000c}'], " ");
         let cleaned = normalize_whitespace(&cleaned);
         if !cleaned.is_empty() {
-            return Some(clip_text(&cleaned, 140));
+            return Some(cleaned);
         }
     }
     None
